@@ -1,0 +1,4 @@
+# dsh-profile-researcher bundle patch
+- insert:
+    - id: researcher
+      name: 'dsh-profile-researcher'
