@@ -77,17 +77,66 @@ export const researchGlossarySchema: z.ZodType<ResearchGlossary> = z.object({
   }
 })
 
-export const researchRunDescriptionSchema: z.ZodType<ResearchRunDescription> = z.object({
-  version: z.literal(1),
+const checkpointPath = nonBlank.refine(value => {
+  try {
+    return normalizeProjectRelativePath(value) === value
+      && !value.split('/').some(part => part === '.git' || part === '.research')
+      && !/[\x00-\x1f\x7f]/u.test(value)
+  } catch { return false }
+}, 'must be a canonical project file path outside Git/research metadata')
+const uniquePaths = z.array(checkpointPath).max(2000).refine(paths => new Set(paths).size === paths.length, 'duplicate paths')
+const oid = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u)
+const checkpointRef = z.string().regex(/^refs\/dsh\/research\/[0-9a-f-]+\/runs\/[0-9a-f-]+\/(?:input|output)$/u)
+
+export const reproductionSchema = z.object({
+  command: nonBlank,
+  cwd: z.union([z.literal('.'), checkpointPath]),
+  environment: jsonRecord,
+  inputs: uniquePaths,
+}).strict()
+
+export const inputCheckpointSchema = z.object({
+  backend: z.literal('git'),
+  inputRef: checkpointRef,
+  outputRef: checkpointRef,
+  inputCommit: oid,
+  inputTree: oid,
+  baseHead: oid,
+  objectFormat: z.enum(['sha1', 'sha256']),
+  files: uniquePaths,
+  reproduction: reproductionSchema,
+}).strict()
+
+export const outputCheckpointSchema = z.object({
+  backend: z.literal('git'),
+  inputRef: checkpointRef,
+  outputRef: checkpointRef,
+  inputCommit: oid,
+  outputCommit: oid,
+  inputTree: oid,
+  outputTree: oid,
+  objectFormat: z.enum(['sha1', 'sha256']),
+  codeChanged: z.boolean(),
+  artifacts: z.array(z.object({
+    path: checkpointPath,
+    sha256: z.string().regex(/^[0-9a-f]{64}$/u),
+    bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).strict()).max(2000),
+}).strict()
+
+const descriptionFields = {
   type: z.literal('description'),
   createdAt: isoUtc,
   sessionId: nonBlank,
   purpose: nonBlank,
   parameters: jsonRecord,
-}).strict()
+}
+export const researchRunDescriptionSchema: z.ZodType<ResearchRunDescription> = z.discriminatedUnion('version', [
+  z.object({ version: z.literal(1), ...descriptionFields }).strict(),
+  z.object({ version: z.literal(2), ...descriptionFields, baseStateRevision: positiveRevision, checkpoint: inputCheckpointSchema }).strict(),
+])
 
-export const researchRunResultSchema: z.ZodType<ResearchRunResult> = z.object({
-  version: z.literal(1),
+const resultFields = {
   type: z.literal('result'),
   finishedAt: isoUtc,
   status: z.enum(['completed', 'failed']),
@@ -96,18 +145,20 @@ export const researchRunResultSchema: z.ZodType<ResearchRunResult> = z.object({
   decision: nonBlank,
   artifacts: z.array(nonBlank),
   transition: researchStateSchema,
-}).strict().superRefine((value, ctx) => {
+}
+export const researchRunResultSchema: z.ZodType<ResearchRunResult> = z.discriminatedUnion('version', [
+  z.object({ version: z.literal(1), ...resultFields }).strict(),
+  z.object({ version: z.literal(2), ...resultFields, checkpoint: outputCheckpointSchema }).strict(),
+]).superRefine((value, ctx) => {
   value.artifacts.forEach((artifact, index) => {
-    try {
-      normalizeProjectRelativePath(artifact)
-    } catch (error) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['artifacts', index],
-        message: error instanceof Error ? error.message : String(error),
-      })
+    try { normalizeProjectRelativePath(artifact) } catch (error) {
+      ctx.addIssue({ code: 'custom', path: ['artifacts', index], message: error instanceof Error ? error.message : String(error) })
     }
   })
+  if (value.version === 2 && (new Set(value.artifacts).size !== value.artifacts.length
+    || JSON.stringify(value.artifacts) !== JSON.stringify(value.checkpoint.artifacts.map(item => item.path)))) {
+    ctx.addIssue({ code: 'custom', path: ['checkpoint', 'artifacts'], message: 'checkpoint digests must match the exact artifact list' })
+  }
 })
 
 export const researchSessionIndexSchema: z.ZodType<ResearchSessionIndex> = z.object({

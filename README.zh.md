@@ -11,6 +11,14 @@
 
 Host service 是唯一领域权威，负责校验、写入、绑定、上下文注入和 Goal 激活。Web client 只用 DSH 标准 `popupSelect` 装饰裸 `/research-load`，选择后仍把完整命令提交回 Host。
 
+## 内部实现边界
+
+- `src/research-store.ts` 的 `ResearchStore` 协调研究状态、run 提交/恢复、完整操作锁、索引策略及上下文预检。
+- `src/record-store.ts` 的 `RecordStore` 提供经过校验的文件读取、安全写入与原观察版本凭证；不运行 Git，不决定研究状态或 Goal。
+- `src/checkpoint.ts` 保持负责 Git 快照和输出封存；`src/storage.ts` 只转导 `ResearchStore`，兼容旧导入路径。
+
+单写者约定、磁盘记录格式和恢复行为没有因拆分改变。
+
 ## 项目目录
 
 ```text
@@ -32,16 +40,31 @@ Research ID 和 Run ID 均为随机 UUID v4。后续 DSH 会话必须显式加�
 
 Web GUI 中输入裸 `/research-load` 会打开目标选择器。损坏目标仍以诊断行显示，但不能提交加载。
 
+若目标存在 open run 或尚未发布的 run state transition，加载返回 `goal_action: recovery-only`：绑定新会话并注入恢复信息，但不恢复 paused/blocked 状态、不创建或修改 DSH Goal。`get_research.research.recovery` 提供 `run_id`、`phase`、记录 `path` 和可选的预定 `output_ref`；后者不代表已封存。先根据原执行证据和已保存的 result/journal 完成原 run，再由人类再次 `/research-load` 正常接续。已有 armed Goal 不会被此加载自动暂停。
+
 ## 模型工具
 
 - `get_research`：读取当前已绑定目标；刻意不提供模型侧 load/switch 工具。
 - `create_research`：在顶层 agent 的直接人类轮创建并绑定目标。
 - `update_research`：在有意义的结果或方向变化后追加状态快照。
-- `start_research_run`：真实执行前打开唯一的当前 run。
+- `start_research_run`：仅在目标为 active 时、真实执行前打开唯一的当前 run；paused/blocked 先显式加载恢复或继续。
 - `finish_research_run`：不可变地关闭 run、校验产物，并追加对应状态。
 - `update_research_glossary`：原子更新目标术语与真正相关文件的说明。
 
 共享状态变更必须来自直接人类轮，或来自标记与当前 research target 精确匹配的当前 DSH Goal Round。Subagent 不能直接修改共享 researcher 状态，只能把证据与结果返回给顶层 agent。
+
+## Git run checkpoint
+
+新 run 使用 v2 记录，start 必须提供 reproduction（command、cwd、environment、inputs）。在实际执行前自动保存输入代码，finish 保存输出代码和产物 SHA-256，再提交不可变结果与 state。旧 v1 run 仍可读取/关闭，但不会补造历史代码快照。
+
+- workspace 必须是 POSIX 系统中已有提交的普通本地 Git 仓库根目录；不自动 git init；第一版不支持 Windows、linked worktree、submodule、符号链接源码等特殊布局。
+- tracked 工作文件（含未提交修改）和显式输入被捕获；不改 HEAD、分支、真实 index 或工作文件，不自动 push。
+- 每个 run 分别固定 input/output 两个 refs/dsh/research/... 引用。输出 commit 内保存精确 finish 日志，崩溃后同 payload 重试不会重新捕获已变化的文件。
+- .git/.research、疑似密钥文件不纳入；未跟踪/ignored 文件须显式声明。产物只保存摘要，外部数据和环境须另行保留。
+- v2 run 打开期间不允许普通 state 更新。停止写入代码/产物后再 finish；源代码中途变化和外部依赖仍可能影响复现。
+- **快照已保存不等于复现已验证**。不自动执行 recipe、不原地回滚；应在独立目录恢复输入代码、重建环境、重跑并比较指标/摘要。
+
+完整协议、恢复步骤与限制见 [checkpoints.md](docs/checkpoints.md)。自定义 Git refs 不会自动随普通 clone/push 传输，跨机器需显式导出，并保留 .research 记录。
 
 ## 可靠性约束
 

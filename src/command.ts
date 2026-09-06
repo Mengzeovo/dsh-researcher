@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from './index.ts'
 import { ResearcherError } from './errors.ts'
+import { renderResearchRecovery } from './context.ts'
 import { parseResearchId } from './schema.ts'
 
 export const name = 'command-researcher'
@@ -10,7 +11,7 @@ export const inject = ['commands', 'researcher']
 export function apply(ctx: Context): void {
   ctx.commands.register({
     name: 'research-load',
-    description: 'load and resume a project research target by research id',
+    description: 'load a project research target for recovery, or resume it when no run is unfinished',
     input: { hint: '[<research-id>]' },
     recordInput: false,
     async handler(invocation) {
@@ -42,6 +43,7 @@ export function apply(ctx: Context): void {
             `Status: ${result.target.state.status}`,
             `Goal action: ${result.goalAction}`,
             `Authority: ${result.target.root}`,
+            ...(result.target.recovery === undefined ? [] : [renderResearchRecovery(result.target.recovery)]),
             ...(result.target.warnings.length === 0 ? [] : [`Warnings: ${result.target.warnings.join('; ')}`]),
           ].join('\n'),
         }

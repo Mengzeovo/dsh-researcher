@@ -1,5 +1,7 @@
 /** Public, lossless-JSON researcher domain types. */
 import type { JsonValue } from '@deepseek-ai/dsh-util-values';
+import type { InputCheckpoint, OutputCheckpoint, ReproductionSpec } from './checkpoint.ts';
+export type { InputCheckpoint, OutputCheckpoint, ReproductionSpec } from './checkpoint.ts';
 declare module '@deepseek-ai/dsh-typert-protocol' {
     interface RemoteErrorDetailsMap {
         'researcher/domain': {
@@ -39,7 +41,7 @@ export interface ResearchGlossary {
     readonly terms: Readonly<Record<string, string>>;
     readonly files: Readonly<Record<string, string>>;
 }
-export interface ResearchRunDescription {
+export interface LegacyRunDescription {
     readonly version: 1;
     readonly type: 'description';
     readonly createdAt: string;
@@ -47,7 +49,14 @@ export interface ResearchRunDescription {
     readonly purpose: string;
     readonly parameters: Readonly<Record<string, JsonValue>>;
 }
-export interface ResearchRunResult {
+/** New descriptions freeze input code before execution. Legacy v1 remains readable. */
+export interface CheckpointRunDescription extends Omit<LegacyRunDescription, 'version'> {
+    readonly version: 2;
+    readonly baseStateRevision: number;
+    readonly checkpoint: InputCheckpoint;
+}
+export type ResearchRunDescription = LegacyRunDescription | CheckpointRunDescription;
+export interface LegacyRunResult {
     readonly version: 1;
     readonly type: 'result';
     readonly finishedAt: string;
@@ -59,6 +68,11 @@ export interface ResearchRunResult {
     /** Exact state transition prepared before the immutable result is published. */
     readonly transition: ResearchState;
 }
+export interface CheckpointRunResult extends Omit<LegacyRunResult, 'version'> {
+    readonly version: 2;
+    readonly checkpoint: OutputCheckpoint;
+}
+export type ResearchRunResult = LegacyRunResult | CheckpointRunResult;
 export interface ResearchRun {
     readonly id: RunId;
     readonly description: ResearchRunDescription;
@@ -76,6 +90,14 @@ export interface ResearchBinding {
     readonly sessionId: string;
     readonly loadedAt: string;
 }
+/** Derived from run records; never persisted into research state or session binding. */
+export interface ResearchRecovery {
+    readonly runId: RunId;
+    readonly phase: 'open' | 'pending-state';
+    readonly path: string;
+    /** Planned ref only: its presence here does not prove that an output was sealed. */
+    readonly outputRef?: string;
+}
 export interface ResearchTargetSnapshot {
     readonly id: ResearchId;
     readonly root: string;
@@ -84,6 +106,7 @@ export interface ResearchTargetSnapshot {
     readonly state: ResearchState;
     readonly glossary: ResearchGlossary;
     readonly latestRun?: ResearchRun;
+    readonly recovery?: ResearchRecovery | undefined;
     readonly warnings: readonly string[];
 }
 export interface ResearchTargetSummary {
@@ -124,6 +147,7 @@ export interface UpdateResearchRequest {
 export interface StartResearchRunRequest {
     readonly purpose: string;
     readonly parameters: Readonly<Record<string, JsonValue>>;
+    readonly reproduction: ReproductionSpec;
 }
 export interface FinishResearchRunRequest {
     readonly runId: RunId;
@@ -158,7 +182,7 @@ export interface ResearchLoadResult {
     readonly eventSeq: number;
     readonly target: ResearchTargetSnapshot;
     readonly context: ResearchContextSnapshot;
-    readonly goalAction: 'created' | 'updated' | 'resumed' | 'completed' | 'unchanged' | 'view-only';
+    readonly goalAction: 'created' | 'updated' | 'resumed' | 'completed' | 'unchanged' | 'view-only' | 'recovery-only';
 }
 export interface ResearchCreateResult extends ResearchLoadResult {
     readonly created: true;
@@ -172,11 +196,13 @@ export interface ResearchRunStartResult {
     readonly researchId: ResearchId;
     readonly runId: RunId;
     readonly path: string;
+    readonly checkpoint: InputCheckpoint;
 }
 export interface ResearchRunFinishResult {
     readonly researchId: ResearchId;
     readonly runId: RunId;
     readonly runStatus: 'completed' | 'failed';
+    readonly checkpoint?: OutputCheckpoint;
     readonly state: ResearchState;
     readonly path: string;
 }
@@ -186,5 +212,4 @@ export interface ResearchGlossaryResult {
     readonly termCount: number;
     readonly fileCount: number;
 }
-export {};
 //# sourceMappingURL=types.d.ts.map

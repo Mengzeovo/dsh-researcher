@@ -1,10 +1,9 @@
 import { mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ResearcherError } from '../src/errors.ts'
 import { parseJsonText, researchSessionIndexSchema } from '../src/schema.ts'
-import { ResearchStore } from '../src/storage.ts'
-import { makeWorkspace, removeWorkspace, testContext, testSession } from './helpers.ts'
+import { failNextWrite, makeWorkspace, newCheckpointStore, removeWorkspace, testContext, testReproduction, testSession } from './helpers.ts'
 
 let workspace: string
 
@@ -18,7 +17,7 @@ afterEach(async () => {
 
 describe('ResearchStore integration', () => {
   it('creates the exact staged target layout and lists it', async () => {
-    const store = new ResearchStore(testContext(workspace))
+    const store = newCheckpointStore(testContext(workspace))
     const session = testSession(workspace)
     const target = await store.createTarget(session, {
       goal: 'Compare candidate A against the baseline.',
@@ -47,7 +46,7 @@ describe('ResearchStore integration', () => {
   })
 
   it('enforces one open run, closes it immutably, and appends its state', async () => {
-    const store = new ResearchStore(testContext(workspace))
+    const store = newCheckpointStore(testContext(workspace))
     const session = testSession(workspace)
     const target = await store.createTarget(session, {
       goal: 'Run one controlled experiment.',
@@ -57,17 +56,19 @@ describe('ResearchStore integration', () => {
     const started = await store.startRun(session, target.id, {
       purpose: 'seed 7 baseline',
       parameters: { seed: 7, nested: { mode: 'baseline' } },
+      reproduction: testReproduction(),
     })
 
     await expect(store.startRun(session, target.id, {
       purpose: 'must wait',
       parameters: {},
+      reproduction: testReproduction(),
     })).rejects.toMatchObject({ code: 'RESEARCH_RUN_OPEN' })
     await expect(store.appendState(session, target.id, {
       status: 'active',
       summary: 'must not point state at an open run',
       lastRunId: started.runId,
-    })).rejects.toMatchObject({ code: 'RESEARCH_INVALID_RECORD' })
+    })).rejects.toMatchObject({ code: 'RESEARCH_RUN_OPEN' })
     await expect(store.appendState(session, target.id, {
       status: 'complete',
       summary: 'must not strand the open run',
@@ -97,7 +98,7 @@ describe('ResearchStore integration', () => {
     await expect(store.finishRun(session, target.id, { ...request, result: 'different immutable result' }))
       .rejects.toMatchObject({ code: 'RESEARCH_RUN_CLOSED' })
 
-    const next = await store.startRun(session, target.id, { purpose: 'seed 8', parameters: { seed: 8 } })
+    const next = await store.startRun(session, target.id, { purpose: 'seed 8', parameters: { seed: 8 }, reproduction: testReproduction() })
     expect(next.runId).not.toBe(started.runId)
 
     const encoded = 'dGVzdC9zZXNzaW9uOjE'
@@ -107,14 +108,15 @@ describe('ResearchStore integration', () => {
   })
 
   it('recovers an interrupted finish exactly once and never replays it over newer state', async () => {
-    const store = new ResearchStore(testContext(workspace))
+    const ctx = testContext(workspace)
+    const store = newCheckpointStore(ctx)
     const session = testSession(workspace)
     const target = await store.createTarget(session, {
       goal: 'Recover a two-file run finish.',
       metrics: ['one exact transition is published'],
       baseline: 'open run',
     })
-    const started = await store.startRun(session, target.id, { purpose: 'recoverable run', parameters: {} })
+    const started = await store.startRun(session, target.id, { purpose: 'recoverable run', parameters: {}, reproduction: testReproduction() })
     await mkdir(path.join(workspace, 'results'))
     const artifact = path.join(workspace, 'results', 'recover.json')
     await writeFile(artifact, '{"ok":true}\n')
@@ -130,18 +132,7 @@ describe('ResearchStore integration', () => {
       next: 'start the next run',
     }
 
-    const internal = store as unknown as {
-      replaceText: (...args: unknown[]) => Promise<void>
-    }
-    const originalReplace = internal.replaceText.bind(store)
-    let failStateOnce = true
-    vi.spyOn(internal, 'replaceText').mockImplementation(async (...args: unknown[]) => {
-      if (failStateOnce && args[2] === `${target.root}/state.jsonl`) {
-        failStateOnce = false
-        throw new Error('simulated state publication failure')
-      }
-      await originalReplace(...args)
-    })
+    await failNextWrite(ctx, `${target.root}/state.jsonl`, 'simulated state publication failure', 'replaceIfVersion')
 
     await expect(store.finishRun(session, target.id, request)).rejects.toThrow(/simulated state publication failure/u)
     expect((await store.readRun(session, target.id, started.runId)).result?.transition.revision).toBe(2)
@@ -151,7 +142,7 @@ describe('ResearchStore integration', () => {
     const recovered = await store.finishRun(session, target.id, request)
     expect(recovered.state).toMatchObject({ revision: 2, lastRunId: started.runId })
 
-    const newer = await store.startRun(session, target.id, { purpose: 'newer run', parameters: {} })
+    const newer = await store.startRun(session, target.id, { purpose: 'newer run', parameters: {}, reproduction: testReproduction() })
     await writeFile(path.join(workspace, 'results', 'newer.json'), '{}\n')
     await store.finishRun(session, target.id, {
       ...request,
@@ -166,7 +157,7 @@ describe('ResearchStore integration', () => {
   })
 
   it('patches glossary records, validates paths, and reports missing relevant files', async () => {
-    const store = new ResearchStore(testContext(workspace))
+    const store = newCheckpointStore(testContext(workspace))
     const session = testSession(workspace)
     const target = await store.createTarget(session, {
       goal: 'Maintain only goal-relevant terminology.',
@@ -212,7 +203,7 @@ describe('ResearchStore integration', () => {
   })
 
   it('resumes paused state and treats complete as terminal', async () => {
-    const store = new ResearchStore(testContext(workspace))
+    const store = newCheckpointStore(testContext(workspace))
     const session = testSession(workspace)
     const target = await store.createTarget(session, {
       goal: 'Exercise lifecycle transitions.',
@@ -225,12 +216,12 @@ describe('ResearchStore integration', () => {
     await store.appendState(session, target.id, { status: 'complete', summary: 'all criteria met' })
     await expect(store.appendState(session, target.id, { status: 'active', summary: 'reopen' }))
       .rejects.toMatchObject({ code: 'RESEARCH_TARGET_COMPLETE' })
-    await expect(store.startRun(session, target.id, { purpose: 'late run', parameters: {} }))
+    await expect(store.startRun(session, target.id, { purpose: 'late run', parameters: {}, reproduction: testReproduction() }))
       .rejects.toMatchObject({ code: 'RESEARCH_TARGET_COMPLETE' })
   })
 
   it('rejects unloadable create, state, and finish transitions before publication', async () => {
-    const store = new ResearchStore(testContext(workspace))
+    const store = newCheckpointStore(testContext(workspace))
     const session = testSession(workspace)
     await expect(store.createTarget(session, {
       goal: 'x'.repeat(40_000),
@@ -251,7 +242,7 @@ describe('ResearchStore integration', () => {
     })).rejects.toMatchObject({ code: 'RESEARCH_OVERSIZED' })
     expect((await store.readTarget(session, target.id)).state).toMatchObject({ revision: 1, status: 'active' })
 
-    const run = await store.startRun(session, target.id, { purpose: 'oversized finish', parameters: {} })
+    const run = await store.startRun(session, target.id, { purpose: 'oversized finish', parameters: {}, reproduction: testReproduction() })
     await expect(store.finishRun(session, target.id, {
       runId: run.runId,
       status: 'completed',
@@ -267,7 +258,7 @@ describe('ResearchStore integration', () => {
   })
 
   it('isolates invalid targets and rejects authority-file symlinks', async () => {
-    const store = new ResearchStore(testContext(workspace))
+    const store = newCheckpointStore(testContext(workspace))
     const session = testSession(workspace)
     const valid = await store.createTarget(session, {
       goal: 'Keep valid records visible.',
@@ -301,7 +292,7 @@ describe('ResearchStore integration', () => {
       try {
         await mkdir(path.join(other, 'goal'))
         await symlink(other, path.join(linkedWorkspace, '.research'), 'dir')
-        const linkedStore = new ResearchStore(testContext(linkedWorkspace))
+        const linkedStore = newCheckpointStore(testContext(linkedWorkspace))
         await expect(linkedStore.listTargets(testSession(linkedWorkspace)))
           .rejects.toBeInstanceOf(ResearcherError)
       } finally {

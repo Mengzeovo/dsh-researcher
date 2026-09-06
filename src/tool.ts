@@ -14,6 +14,17 @@ export const inject = ['agents', 'goals', 'researcher', 'sessionProjections', 't
 
 const STATUS_VALUES = ['active', 'paused', 'blocked', 'complete'] as const
 const RUN_STATUS_VALUES = ['completed', 'failed'] as const
+const CHECKPOINT_OUTPUT = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    input_commit: { type: 'string', required: true },
+    input_ref: { type: 'string', required: true },
+    output_commit: { type: 'string' },
+    output_ref: { type: 'string', required: true },
+    code_changed: { type: 'boolean' },
+    verification: { type: 'string', required: true },
+  },
+} as const
 
 const RESEARCH_STATE_OUTPUT = {
   type: 'object',
@@ -77,6 +88,7 @@ export function apply(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'get_research',
     description: 'Read the currently loaded cross-session research target and its bounded authoritative snapshot. '
+      + 'Recovery, when present, identifies an open run or a closed run whose state is pending. output_ref is planned, not proof of sealing; inspect its journal if present and reuse the exact original finish payload. '
       + 'There is no model load action; if none is loaded, ask the human to use /research-load.',
     parameters: {},
     output: output({
@@ -98,6 +110,15 @@ export function apply(ctx: Context): void {
             direction: { type: 'string' },
             next: { type: 'string' },
             last_run_id: { type: 'string' },
+            recovery: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                run_id: { type: 'string', required: true },
+                phase: { type: 'string', required: true, enum: ['open', 'pending-state'] },
+                path: { type: 'string', required: true },
+                output_ref: { type: 'string', description: 'Planned Git ref; read its commit-message journal if it exists. Not proof of sealing.' },
+              },
+            },
             warnings: { type: 'array', required: true, items: { type: 'string' } },
             context: { type: 'string', required: true },
           },
@@ -108,6 +129,7 @@ export function apply(ctx: Context): void {
       const execution = researchToolExecution(ctx, exec)
       const result = await ctx.researcher.get(execution.agent, exec.signal)
       const state = result.target.state
+      const recovery = result.target.recovery
       return {
         research: {
           id: result.researchId,
@@ -120,6 +142,10 @@ export function apply(ctx: Context): void {
           ...(state.direction === undefined ? {} : { direction: state.direction }),
           ...(state.next === undefined ? {} : { next: state.next }),
           ...(state.lastRunId === undefined ? {} : { last_run_id: state.lastRunId }),
+          ...(recovery === undefined ? {} : { recovery: {
+            run_id: recovery.runId, phase: recovery.phase, path: recovery.path,
+            ...(recovery.outputRef === undefined ? {} : { output_ref: recovery.outputRef }),
+          } }),
           warnings: [...result.target.warnings],
           context: result.context.text,
         },
@@ -220,10 +246,22 @@ export function apply(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'start_research_run',
     description: 'Create the single open immutable research run before every actual execution, rerun, seed change, or parameter change. '
-      + 'parameters must be lossless JSON. Finish any existing open run first; starting a run does not execute the experiment itself.',
+      + 'Only active research targets can start a run; ask the human to /research-load paused/blocked targets to recover or resume them first. '
+      + 'Freeze Git input code with a reproduction recipe before execution. Requires a committed plain Git repository at the workspace root. '
+      + 'Tracked working files and explicit reproduction.inputs are captured; never include secrets. environment is descriptive, not injected. '
+      + 'Finish any open run first. This tool does not execute the recipe; do not edit source during execution or claim snapshot capture proves reproducibility.',
     parameters: {
       purpose: { type: 'string', required: true },
       parameters: { type: 'object', required: true, additionalProperties: true },
+      reproduction: {
+        type: 'object', required: true, additionalProperties: false,
+        properties: {
+          command: { type: 'string', required: true, description: 'Exact shell command/script including build and run steps, with no literal secrets.' },
+          cwd: { type: 'string', required: true, description: 'Project-relative command directory, or dot for the root.' },
+          environment: { type: 'object', required: true, additionalProperties: true, description: 'Non-secret environment/dependency/data versions, container digest and determinism constraints; descriptive only.' },
+          inputs: { type: 'array', required: true, items: { type: 'string' }, description: 'Explicit extra regular input/code files including needed untracked/ignored files. Tracked working files are captured automatically. No directories.' },
+        },
+      },
     },
     output: output({
       type: 'object',
@@ -232,6 +270,7 @@ export function apply(ctx: Context): void {
         id: { type: 'string', required: true },
         run_id: { type: 'string', required: true },
         path: { type: 'string', required: true },
+        checkpoint: { ...CHECKPOINT_OUTPUT, required: true },
       },
     }),
     async execute(args, exec) {
@@ -241,8 +280,14 @@ export function apply(ctx: Context): void {
       const result = await ctx.researcher.startRun(execution.agent, {
         purpose: args.purpose,
         parameters: args.parameters,
+        reproduction: args.reproduction,
       }, exec.signal)
-      return { id, run_id: result.runId, path: result.path }
+      return { id, run_id: result.runId, path: result.path, checkpoint: {
+        input_commit: result.checkpoint.inputCommit,
+        input_ref: result.checkpoint.inputRef,
+        output_ref: result.checkpoint.outputRef,
+        verification: 'snapshot-only; execute and independently compare results to verify reproducibility',
+      } }
     },
     presentCall: args => present('Start research run', 'other', args.purpose),
   }))
@@ -250,7 +295,8 @@ export function apply(ctx: Context): void {
   ctx.tools.register(defineTool({
     name: 'finish_research_run',
     description: 'Finish exactly one open research run, verify its project-relative artifacts, and then append the resulting research state. '
-      + 'A negative scientific outcome is completed; failed is only an execution failure. Results and the prepared state transition are immutable; retry an interrupted finish with the exact same payload.',
+      + 'For checkpoint runs, seal output code and SHA-256 artifact digests in Git before closing the record. Artifact paths must be regular files. '
+      + 'A negative scientific outcome is completed; failed is only an execution failure. Results, checkpoint and prepared state are immutable; retry interrupted finish with the exact same payload, even if workspace files changed. No automatic rerun/restore or reproducibility guarantee.',
     parameters: {
       run_id: { type: 'string', required: true },
       status: { type: 'string', required: true, enum: RUN_STATUS_VALUES },
@@ -270,6 +316,7 @@ export function apply(ctx: Context): void {
         id: { type: 'string', required: true },
         run_id: { type: 'string', required: true },
         run_status: { type: 'string', required: true, enum: RUN_STATUS_VALUES },
+        checkpoint: CHECKPOINT_OUTPUT,
         research_state: { ...RESEARCH_STATE_OUTPUT, required: true },
         path: { type: 'string', required: true },
         goal_followup: { type: 'string', required: true },
@@ -295,6 +342,12 @@ export function apply(ctx: Context): void {
         id,
         run_id: result.runId,
         run_status: result.runStatus,
+        ...(result.checkpoint === undefined ? {} : { checkpoint: {
+          input_commit: result.checkpoint.inputCommit, input_ref: result.checkpoint.inputRef,
+          output_commit: result.checkpoint.outputCommit, output_ref: result.checkpoint.outputRef,
+          code_changed: result.checkpoint.codeChanged,
+          verification: 'snapshot-only; no independent reproduction was performed',
+        } }),
         research_state: stateValue(result.state),
         path: result.path,
         goal_followup: 'If research_status pauses, blocks, or completes the objective, update the native DSH Goal separately now.',

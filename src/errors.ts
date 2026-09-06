@@ -2,6 +2,7 @@ import { HarnessError } from '@deepseek-ai/dsh-llm'
 
 export type ResearcherErrorCode =
   | 'RESEARCH_AUTHORITY_REQUIRED'
+  | 'RESEARCH_CHECKPOINT_INVALID'
   | 'RESEARCH_DRIVER_REQUIRED'
   | 'RESEARCH_GOAL_CONFLICT'
   | 'RESEARCH_INVALID_RECORD'
@@ -15,6 +16,7 @@ export type ResearcherErrorCode =
   | 'RESEARCH_SESSION_NOT_LIVE'
   | 'RESEARCH_STALE_WRITE'
   | 'RESEARCH_TARGET_COMPLETE'
+  | 'RESEARCH_TARGET_INACTIVE'
 
 export class ResearcherError extends HarnessError {
   declare readonly code: ResearcherErrorCode

@@ -5,6 +5,7 @@ import { type Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-fs'
 import type { GoalView } from '@deepseek-ai/dsh-goal'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
+import type {} from '@deepseek-ai/dsh-subprocess'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
@@ -20,7 +21,7 @@ import {
 } from './context.ts'
 import { ResearcherError } from './errors.ts'
 import { nowIso, parseResearchId, researchBindingSchema, researchTargetListRequestSchema } from './schema.ts'
-import { ResearchStore } from './storage.ts'
+import { ResearchStore } from './research-store.ts'
 import type {
   CreateResearchRequest,
   FinishResearchRunRequest,
@@ -134,7 +135,7 @@ class SerialGate {
 }
 
 export class ResearcherService extends TypertRemoteService {
-  static inject = ['agents', 'fs', 'goals', 'sandboxPolicy', 'sessionProjections']
+  static inject = ['agents', 'fs', 'goals', 'sandbox', 'sandboxPolicy', 'sessionProjections', 'subprocess']
 
   private readonly store: ResearchStore
   private readonly activationGates = new WeakMap<Session, SerialGate>()
@@ -250,8 +251,9 @@ export class ResearcherService extends TypertRemoteService {
   ): Promise<ResearchLoadResult> {
     this.assertBindingCompatible(agent.session, initialTarget.id)
     this.assertGoalCompatible(agent, initialTarget.id)
-    this.assertGoalActivationCapacity(agent, initialTarget)
-    const target = initialTarget.state.status === 'paused' || initialTarget.state.status === 'blocked'
+    if (initialTarget.recovery === undefined) this.assertGoalActivationCapacity(agent, initialTarget)
+    const target = initialTarget.recovery === undefined
+      && (initialTarget.state.status === 'paused' || initialTarget.state.status === 'blocked')
       ? await this.store.resumeState(agent.session, initialTarget.id, signal)
       : initialTarget
     const loadedAt = nowIso()
@@ -273,7 +275,8 @@ export class ResearcherService extends TypertRemoteService {
     }
     let goalAction: ResearchLoadResult['goalAction']
     try {
-      goalAction = this.applyGoalActivation(agent, target)
+      // Recovery binds a session but never edits frozen state or changes an existing Goal.
+      goalAction = target.recovery === undefined ? this.applyGoalActivation(agent, target) : 'recovery-only'
     } catch (error) {
       throw new ResearcherError(
         `research target ${target.id} was loaded and injected, but its DSH Goal could not be activated; retry /research-load ${target.id}`,
@@ -381,6 +384,7 @@ export const inject = ResearcherService.inject
 export default ResearcherService
 
 export type {
+  ResearchRecovery,
   CreateResearchRequest,
   FinishResearchRunRequest,
   ResearchBinding,

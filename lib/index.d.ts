@@ -53,6 +53,6 @@ export declare class ResearcherService extends TypertRemoteService {
 export declare const name = "researcher";
 export declare const inject: string[];
 export default ResearcherService;
-export type { CreateResearchRequest, FinishResearchRunRequest, ResearchBinding, ResearchCreateResult, ResearchGlossaryPatch, ResearchGlossaryResult, ResearchId, ResearchLoadResult, ResearchReadResult, ResearchRunFinishResult, ResearchRunStartResult, ResearchStateResult, ResearchTargetList, ResearchTargetListRequest, StartResearchRunRequest, UpdateResearchRequest, } from './types.ts';
+export type { ResearchRecovery, CreateResearchRequest, FinishResearchRunRequest, ResearchBinding, ResearchCreateResult, ResearchGlossaryPatch, ResearchGlossaryResult, ResearchId, ResearchLoadResult, ResearchReadResult, ResearchRunFinishResult, ResearchRunStartResult, ResearchStateResult, ResearchTargetList, ResearchTargetListRequest, StartResearchRunRequest, UpdateResearchRequest, } from './types.ts';
 export { ResearcherError } from './errors.ts';
 //# sourceMappingURL=index.d.ts.map
