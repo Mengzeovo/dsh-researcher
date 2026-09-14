@@ -11,6 +11,7 @@ import { vi } from 'vitest'
 import type { GitCheckpointProvider, OutputCheckpoint, ReproductionSpec } from '../src/checkpoint.ts'
 import { ResearcherError } from '../src/errors.ts'
 import { ResearchStore } from '../src/storage.ts'
+import type { ResearchId, StartResearchRunRequest } from '../src/types.ts'
 
 interface TestTarget {
   readonly path: string
@@ -80,6 +81,13 @@ export function testContext(workspace: string): Context {
     async readText(target: TestTarget): Promise<string> {
       return await readFile(target.path, 'utf8')
     },
+    async readBytes(target: TestTarget, _signal: AbortSignal | undefined, maxBytes: number): Promise<Uint8Array> {
+      const info = await stat(target.path)
+      if (info.size > maxBytes) throw new FsError('file exceeds byte bound', 'FS_TOO_LARGE')
+      const bytes = await readFile(target.path)
+      if (bytes.byteLength > maxBytes) throw new FsError('file exceeds byte bound', 'FS_TOO_LARGE')
+      return bytes
+    },
     async streamText(target: TestTarget): Promise<AsyncIterable<string>> {
       const stream = createReadStream(target.path, { encoding: 'utf8' })
       return stream
@@ -123,6 +131,7 @@ export function testContext(workspace: string): Context {
 
   return {
     fs,
+    emit: vi.fn(),
     sandboxPolicy: {
       resolve: () => ({ mode: 'workspace-write', workspaceRoot: workspace }),
     },
@@ -174,6 +183,20 @@ export function testReproduction(overrides: Partial<ReproductionSpec> = {}): Rep
   }
 }
 
+/** Explicit test setup for the new mandatory plan gate; legacy fixtures must not use this helper. */
+export async function ensureSelectedTestPlan(store: ResearchStore, session: Session, id: ResearchId | string) {
+  const target = await store.readTarget(session, id)
+  if (target.state.selectedPlanRef !== undefined) return { planId: target.state.selectedPlanRef.planId, revision: target.state.selectedPlanRef.revision }
+  const plan = await store.createPlan(session, id, { title: 'Fixture execution plan', body: 'Run the fixture and verify the expected result and recovery boundaries.', delta: ['Initial fixture plan'] })
+  await store.selectPlan(session, id, { planId: plan.plan.metadata.plan_id, revision: 1, expectedStateRevision: target.state.revision })
+  return { planId: plan.plan.metadata.plan_id, revision: 1 }
+}
+
+export async function startPlannedTestRun(store: ResearchStore, session: Session, id: ResearchId | string, request: Omit<StartResearchRunRequest, 'plan'> & { plan?: StartResearchRunRequest['plan'] }) {
+  const plan = request.plan ?? await ensureSelectedTestPlan(store, session, id)
+  return await store.startRun(session, id, { ...request, plan })
+}
+
 /** A fake Git journal, not an artifact-validation bypass: first seal reads actual bytes. */
 export function mockCheckpoints() {
   const sealed = new Map<string, {
@@ -192,7 +215,7 @@ export function mockCheckpoints() {
     files: [...reproduction.inputs],
     reproduction: structuredClone(reproduction),
   }))
-  const finish = vi.fn<GitCheckpointProvider['finish']>(async (session, input, requestKey, prepared, _signal, validate) => {
+  const finish = vi.fn<GitCheckpointProvider['finish']>(async (session, input, requestKey, prepared, _signal, validate, beforeCapture) => {
     const existing = sealed.get(input.outputRef)
     if (existing !== undefined) {
       if (existing.requestKey !== requestKey) {
@@ -202,6 +225,7 @@ export function mockCheckpoints() {
       validate?.(recovered)
       return recovered
     }
+    await beforeCapture?.()
     const artifactPaths = prepared.artifacts
     if (!Array.isArray(artifactPaths) || artifactPaths.some(item => typeof item !== 'string')) {
       throw new Error('fake checkpoint received invalid prepared artifact paths')

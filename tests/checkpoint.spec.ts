@@ -6,7 +6,7 @@ import { PassThrough, Readable } from 'node:stream'
 import type { Context } from '@deepseek-ai/cordis'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { CHECKPOINT_MAX_FILE_BYTES, GitCheckpointProvider, type ReproductionSpec } from '../src/checkpoint.ts'
+import { CHECKPOINT_MAX_FILE_BYTES, GitCheckpointProvider, type InputCheckpoint, type ReproductionSpec } from '../src/checkpoint.ts'
 import { createGitRunner, gitEnvironment, type GitCommand, type GitResult, type GitRunner } from '../src/git-runtime.ts'
 import { makeWorkspace, removeWorkspace, testContext, testSession } from './helpers.ts'
 
@@ -15,6 +15,12 @@ const reproduction = (inputs: string[] = []): ReproductionSpec => ({ command: 'd
 const prepared = (artifacts: string[] = []): Record<string, JsonValue> => ({
   version: 1, type: 'result', finishedAt: at, status: 'completed', result: 'done', metrics: { score: 1 }, decision: 'keep', artifacts,
   transition: { version: 1, revision: 2, at, sessionId: 'test', status: 'active', summary: 'done', lastRunId: 'run-1' },
+})
+const planRunId = '123e4567-e89b-42d3-b456-426614174001'
+const planRef = { planId: 1, revision: 2, sha256: 'a'.repeat(64) }
+const plannedPrepared = (artifacts: string[] = []): Record<string, JsonValue> => ({
+  ...prepared(artifacts), version: 3, planRef,
+  transition: { version: 2, revision: 2, at, sessionId: 'test', status: 'active', summary: 'done', lastRunId: planRunId, selectedPlanRef: planRef },
 })
 /** Deliberately test-only unconfined executor; production never imports child_process. */
 const runner: GitRunner = command => new Promise((resolve, reject) => {
@@ -185,6 +191,101 @@ describe('immutable raw Git checkpoints', () => {
     expect(input.inputCommit).toHaveLength(64)
     const output = await provider.finish(testSession(root), input, 'key', prepared())
     expect(output.checkpoint.outputCommit).toHaveLength(64)
+  })
+})
+
+describe('versioned checkpoint journal compatibility', () => {
+  const journalCheckpoint = (input: InputCheckpoint) => ({
+    backend: 'git', inputCommit: input.inputCommit, inputTree: input.inputTree, outputTree: input.inputTree,
+    inputRef: input.inputRef, outputRef: input.outputRef, objectFormat: input.objectFormat, artifacts: [], codeChanged: false,
+  })
+  const publishJournal = async (input: InputCheckpoint, version: number, original: Record<string, JsonValue>, requestKey: string) => {
+    // Explicit fixture, independent of the current output-journal writer.
+    const body = { version, type: 'dsh-research-output', requestKey, prepared: original, checkpoint: journalCheckpoint(input) }
+    const commit = (await git('commit-tree', input.inputTree, '-p', input.inputCommit, '-m', JSON.stringify(body))).toString().trim()
+    await git('update-ref', input.outputRef, commit)
+    return commit
+  }
+
+  it('recovers an explicitly old envelope1/prepared1 journal without upgrading its transition', async () => {
+    const input = await start()
+    const original = prepared()
+    const commit = await publishJournal(input, 1, original, 'legacy-request-key')
+    await put('code.txt', 'changed after old output seal')
+    const beforeCapture = vi.fn(async () => { throw new Error('must not inspect current plan') })
+    const fresh = new GitCheckpointProvider(ctx, runner)
+    const recovered = await fresh.finish(testSession(root), input, 'legacy-request-key', { ignored: 'new caller material' }, undefined, undefined, beforeCapture)
+    expect(recovered.prepared).toEqual(original)
+    expect(recovered.prepared.transition).toEqual({ version: 1, revision: 2, at, sessionId: 'test', status: 'active', summary: 'done', lastRunId: 'run-1' })
+    expect(recovered.prepared).not.toHaveProperty('planRef')
+    expect(recovered.prepared.transition).not.toHaveProperty('selectedPlanRef')
+    expect(recovered.checkpoint.outputCommit).toBe(commit)
+    expect(beforeCapture).not.toHaveBeenCalled()
+  })
+
+  it('writes envelope2/prepared3 without self-reference and replays the exact plan after mutation', async () => {
+    const input = await start([], planRunId)
+    const inputRaw = (await git('cat-file', 'commit', input.inputCommit)).toString()
+    expect(JSON.parse(inputRaw.slice(inputRaw.indexOf('\n\n') + 2)).version).toBe(1)
+    await put('report', 'original result')
+    const original = plannedPrepared(['report'])
+    const beforeCapture = vi.fn(async () => {})
+    const first = await provider.finish(testSession(root), input, 'plan-request-key', original, undefined, undefined, beforeCapture)
+    expect(beforeCapture).toHaveBeenCalledOnce()
+    const raw = (await git('cat-file', 'commit', first.checkpoint.outputCommit)).toString()
+    const journal = JSON.parse(raw.slice(raw.indexOf('\n\n') + 2))
+    expect(journal.version).toBe(2)
+    expect(journal.prepared).toEqual(original)
+    expect(journal.prepared.version).toBe(3)
+    expect(journal.prepared).not.toHaveProperty('checkpoint')
+    expect(journal.checkpoint).not.toHaveProperty('outputCommit')
+    await put('code.txt', 'changed after plan result was sealed')
+    await rm(path.join(root, 'report'))
+    const fresh = new GitCheckpointProvider(ctx, runner)
+    const retry = await fresh.finish(testSession(root), input, 'plan-request-key', { ignored: 'not a new result' }, undefined, undefined, beforeCapture)
+    expect(retry).toEqual(first)
+    expect(retry.prepared.planRef).toEqual(planRef)
+    expect(beforeCapture).toHaveBeenCalledOnce()
+    await expect(fresh.finish(testSession(root), input, 'different-plan-key', original)).rejects.toThrow(/conflict/u)
+  })
+
+  it.each([[1, 3], [2, 1], [3, 3]])('rejects unsupported envelope/prepared pairing %i/%i', async (envelope, version) => {
+    const input = await start([], planRunId)
+    const original = version === 1 ? prepared() : plannedPrepared()
+    await publishJournal(input, envelope!, original, 'key')
+    const beforeCapture = vi.fn(async () => {})
+    await expect(provider.finish(testSession(root), input, 'key', plannedPrepared(), undefined, undefined, beforeCapture)).rejects.toThrow(/journal/u)
+    expect(beforeCapture).not.toHaveBeenCalled()
+  })
+
+  it('validates a recovered v3 plan/selection pairing rather than trusting journal version alone', async () => {
+    const input = await start([], planRunId)
+    const invalid = { ...plannedPrepared(), planRef: { ...planRef, revision: 3 } }
+    await publishJournal(input, 2, invalid, 'key')
+    await expect(provider.finish(testSession(root), input, 'key', plannedPrepared())).rejects.toThrow(/prepared plan result/u)
+  })
+
+  it('runs the optional integrity gate before first capture and publishes no output when it rejects', async () => {
+    const input = await start([], planRunId)
+    const spy = vi.fn(runner)
+    const gated = new GitCheckpointProvider(ctx, spy)
+    const beforeCapture = vi.fn(async () => { throw new Error('pinned plan digest changed') })
+    await expect(gated.finish(testSession(root), input, 'key', plannedPrepared(), undefined, undefined, beforeCapture)).rejects.toMatchObject({ code: 'RESEARCH_CHECKPOINT_INVALID' })
+    expect(beforeCapture).toHaveBeenCalledOnce()
+    expect(spy.mock.calls.some(([command]) => command.argv.includes('hash-object') || command.argv.includes('commit-tree'))).toBe(false)
+    expect(await pinned()).not.toContain('/output')
+  })
+
+  it.each(['missing-plan', 'different-selection', 'embedded-checkpoint'] as const)('rejects %s before publishing a v3 output', async problem => {
+    const input = await start([], planRunId)
+    const original = plannedPrepared()
+    if (problem === 'missing-plan') delete original.planRef
+    else if (problem === 'different-selection') original.planRef = { ...planRef, revision: 3 }
+    else original.checkpoint = {}
+    const beforeCapture = vi.fn(async () => {})
+    await expect(provider.finish(testSession(root), input, 'key', original, undefined, undefined, beforeCapture)).rejects.toThrow(/prepared plan result/u)
+    expect(beforeCapture).not.toHaveBeenCalled()
+    expect(await pinned()).not.toContain('/output')
   })
 })
 

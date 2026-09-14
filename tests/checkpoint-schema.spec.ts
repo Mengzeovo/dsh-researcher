@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseRunId, reproductionSchema, researchRunResultSchema } from '../src/schema.ts'
+import { parseRunId, reproductionSchema, researchPreparedRunResultSchema, researchRunDescriptionSchema, researchRunResultSchema } from '../src/schema.ts'
 import { parseRunLog } from '../src/jsonl.ts'
 
 const id = parseRunId('123e4567-e89b-42d3-b456-426614174001')
@@ -27,6 +27,24 @@ describe('checkpoint record validation', () => {
     expect(parseRunLog(id, text(description, result)).description.version).toBe(2)
     const { checkpoint: _checkpoint, ...fields } = result
     expect(() => parseRunLog(id, text(description, { ...fields, version: 1 }))).toThrow(/versions disagree/u)
+  })
+  it('preserves legacy records and permits a first legacy finish with supported newer state', () => {
+    const { description, result } = fixture()
+    const original = parseRunLog(id, text(description, result))
+    expect(original.description).toEqual(description)
+    expect(original.result).toEqual(result)
+    const { checkpoint: _checkpoint, ...legacyPrepared } = result
+    const prepared = { ...legacyPrepared, version: 1 }
+    expect(researchPreparedRunResultSchema.parse(prepared)).toEqual(prepared)
+    expect(researchPreparedRunResultSchema.parse(prepared).transition.version).toBe(1)
+    const selectedPlanRef = { planId: 1, revision: 1, sha256: 'a'.repeat(64) }
+    const supported = { ...result, transition: { ...result.transition, version: 2, selectedPlanRef } }
+    const closed = parseRunLog(id, text(description, supported))
+    expect(closed.result).toEqual(supported)
+    expect(closed.description).not.toHaveProperty('planRef')
+    expect(closed.result).not.toHaveProperty('planRef')
+    expect(researchRunDescriptionSchema.safeParse({ ...description, planRef: selectedPlanRef }).success).toBe(false)
+    expect(researchRunResultSchema.safeParse({ ...result, planRef: selectedPlanRef }).success).toBe(false)
   })
   it('validates recipe paths, required fields and JSON metadata', () => {
     const { description } = fixture()

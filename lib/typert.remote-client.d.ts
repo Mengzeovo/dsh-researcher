@@ -1,10 +1,12 @@
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol';
-import type { ResearchTargetList, ResearchTargetListRequest } from './types.ts';
+import type { ResearchTargetList, ResearchTargetListRequest, ResearchViewClientConfig } from './types.ts';
 declare module '@deepseek-ai/dsh-typert-protocol' {
     interface TypertRemoteNamespace$72657365617263686572 {
+        getViewConfig: (signal?: AbortSignal) => Promise<RemoteResult<ResearchViewClientConfig>>;
         list: (request: ResearchTargetListRequest, signal?: AbortSignal) => Promise<RemoteResult<ResearchTargetList>>;
     }
     interface TypertRemoteMap {
+        'researcher/getViewConfig': (signal?: AbortSignal) => Promise<RemoteResult<ResearchViewClientConfig>>;
         'researcher/list': (request: ResearchTargetListRequest, signal?: AbortSignal) => Promise<RemoteResult<ResearchTargetList>>;
     }
     interface TypertRemoteNamespaceMap {
@@ -13,7 +15,24 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 }
 export declare const TYPERT_REMOTE: {
     package: string;
-    descriptors: {
+    descriptors: ({
+        id: string;
+        service: string;
+        namespace: string;
+        method: string;
+        invocation: {
+            kind: "direct";
+        };
+        parameters: never[];
+        cancellation: {
+            parameter: "signal";
+        };
+        result: {
+            mode: "strict";
+            typeSymbol: string;
+            schema: import("zod").ZodType<ResearchViewClientConfig, unknown, import("zod/v4/core").$ZodTypeInternals<ResearchViewClientConfig, unknown>>;
+        };
+    } | {
         id: string;
         service: string;
         namespace: string;
@@ -39,7 +58,7 @@ export declare const TYPERT_REMOTE: {
             typeSymbol: string;
             schema: import("zod").ZodType<ResearchTargetList, unknown, import("zod/v4/core").$ZodTypeInternals<ResearchTargetList, unknown>>;
         };
-    }[];
+    })[];
 };
 export default TYPERT_REMOTE;
 //# sourceMappingURL=typert.remote-client.d.ts.map

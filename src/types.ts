@@ -1,8 +1,12 @@
 /** Public, lossless-JSON researcher domain types. */
 
+export type * from './view-types.ts'
+
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { InputCheckpoint, OutputCheckpoint, ReproductionSpec } from './checkpoint.ts'
+import type { PlanContentInput, PlanDocument, PlanVersionRef } from './plan-schema.ts'
 export type { InputCheckpoint, OutputCheckpoint, ReproductionSpec } from './checkpoint.ts'
+export type { PlanContentInput, PlanDocument, PlanVersionRef } from './plan-schema.ts'
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface RemoteErrorDetailsMap {
@@ -15,6 +19,12 @@ const runIdBrand: unique symbol = Symbol('RunId')
 
 export type ResearchId = string & { readonly [researchIdBrand]: true }
 export type RunId = string & { readonly [runIdBrand]: true }
+/** Public Host-authoritative UI settings; no other Host configuration is exposed. */
+export interface ResearchViewClientConfig {
+  readonly enabled: boolean
+  readonly presetIds: readonly string[]
+}
+
 export type ResearchStatus = 'active' | 'paused' | 'blocked' | 'complete'
 
 export interface ResearchGoalDocument {
@@ -25,8 +35,10 @@ export interface ResearchGoalDocument {
   readonly description: string
 }
 
-export interface ResearchState {
+export interface ResearchStateV1 {
   readonly version: 1
+  /** Legacy records have no selection; their schema does not permit this field. */
+  readonly selectedPlanRef?: undefined
   readonly revision: number
   readonly at: string
   readonly sessionId: string
@@ -36,6 +48,13 @@ export interface ResearchState {
   readonly next?: string | undefined
   readonly lastRunId?: RunId | undefined
 }
+
+export interface ResearchStateV2 extends Omit<ResearchStateV1, 'version' | 'selectedPlanRef'> {
+  readonly version: 2
+  readonly selectedPlanRef?: PlanVersionRef | undefined
+}
+
+export type ResearchState = ResearchStateV1 | ResearchStateV2
 
 export interface ResearchGlossary {
   readonly version: 1
@@ -52,14 +71,28 @@ export interface LegacyRunDescription {
   readonly parameters: Readonly<Record<string, JsonValue>>
 }
 
-/** New descriptions freeze input code before execution. Legacy v1 remains readable. */
+/** Pre-plan descriptions freeze input code; legacy v1/v2 remain readable. */
 export interface CheckpointRunDescription extends Omit<LegacyRunDescription, 'version'> {
   readonly version: 2
   readonly baseStateRevision: number
   readonly checkpoint: InputCheckpoint
 }
 
-export type ResearchRunDescription = LegacyRunDescription | CheckpointRunDescription
+export interface PlanRunDescription extends Omit<CheckpointRunDescription, 'version'> {
+  readonly version: 3
+  readonly planRef: PlanVersionRef
+}
+
+export type ResearchRunDescription = LegacyRunDescription | CheckpointRunDescription | PlanRunDescription
+
+export function isCheckpointRunDescription(value: ResearchRunDescription): value is CheckpointRunDescription | PlanRunDescription {
+  return value.version === 2 || value.version === 3
+}
+
+export function samePlanVersionRef(left: PlanVersionRef | undefined, right: PlanVersionRef | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right
+  return left.planId === right.planId && left.revision === right.revision && left.sha256 === right.sha256
+}
 
 export interface LegacyRunResult {
   readonly version: 1
@@ -79,7 +112,21 @@ export interface CheckpointRunResult extends Omit<LegacyRunResult, 'version'> {
   readonly checkpoint: OutputCheckpoint
 }
 
-export type ResearchRunResult = LegacyRunResult | CheckpointRunResult
+export interface PlanRunResult extends Omit<CheckpointRunResult, 'version' | 'transition'> {
+  readonly version: 3
+  readonly planRef: PlanVersionRef
+  readonly transition: ResearchStateV2 & { readonly selectedPlanRef: PlanVersionRef }
+}
+
+/** Journal payloads cannot contain the output checkpoint, whose commit is not known yet. */
+export type PreparedPlanRunResult = Omit<PlanRunResult, 'checkpoint'>
+export type PreparedResearchRunResult = LegacyRunResult | PreparedPlanRunResult
+
+export type ResearchRunResult = LegacyRunResult | CheckpointRunResult | PlanRunResult
+
+export function isCheckpointRunResult(value: ResearchRunResult): value is CheckpointRunResult | PlanRunResult {
+  return value.version === 2 || value.version === 3
+}
 
 export interface ResearchRun {
   readonly id: RunId
@@ -108,6 +155,7 @@ export interface ResearchRecovery {
   readonly path: string
   /** Planned ref only: its presence here does not prove that an output was sealed. */
   readonly outputRef?: string
+  readonly planRef?: PlanVersionRef
 }
 
 export interface ResearchTargetSnapshot {
@@ -116,6 +164,8 @@ export interface ResearchTargetSnapshot {
   readonly goalPath: string
   readonly goal: ResearchGoalDocument
   readonly state: ResearchState
+  /** Resolved metadata for the exact selection; never a latest-revision alias. */
+  readonly selectedPlan?: { readonly ref: PlanVersionRef; readonly title: string; readonly path: string }
   readonly glossary: ResearchGlossary
   readonly latestRun?: ResearchRun
   readonly recovery?: ResearchRecovery | undefined
@@ -164,6 +214,7 @@ export interface UpdateResearchRequest {
 }
 
 export interface StartResearchRunRequest {
+  readonly plan: { readonly planId: number; readonly revision: number }
   readonly purpose: string
   readonly parameters: Readonly<Record<string, JsonValue>>
   readonly reproduction: ReproductionSpec
@@ -182,6 +233,53 @@ export interface FinishResearchRunRequest {
   readonly next?: string
 }
 
+export type CreateResearchPlanRequest = PlanContentInput
+
+export interface UpdateResearchPlanRequest extends PlanContentInput {
+  readonly planId: number
+  readonly expectedRevision: number
+}
+
+export interface GetResearchPlanRequest {
+  readonly planId: number
+  readonly revision?: number
+}
+
+export interface ListResearchPlansRequest {
+  readonly afterId?: number
+  readonly limit?: number
+}
+
+export interface SelectResearchPlanRequest {
+  readonly planId: number
+  readonly revision: number
+  readonly expectedStateRevision: number
+}
+
+export interface ResearchPlanReadResult {
+  readonly researchId: ResearchId
+  readonly plan: PlanDocument
+  readonly path: string
+  readonly latestRevision: number
+  readonly warnings: readonly string[]
+}
+
+export interface ResearchPlanSummary {
+  readonly planId: number
+  readonly latestRevision: number
+  readonly title: string
+  readonly createdAt: string
+  readonly sha256: string
+  readonly path: string
+}
+
+export interface ResearchPlanListResult {
+  readonly researchId: ResearchId
+  readonly plans: readonly ResearchPlanSummary[]
+  readonly invalid: readonly { readonly planId: number; readonly code: string; readonly detail: string }[]
+  readonly nextAfterId?: number
+}
+
 export interface ResearchGlossaryPatch {
   readonly terms?: Readonly<Record<string, string | null>>
   readonly files?: Readonly<Record<string, string | null>>
@@ -198,15 +296,31 @@ export interface ResearchReadResult {
   readonly context: ResearchContextSnapshot
 }
 
-export interface ResearchLoadResult {
+interface ResearchContextResult {
   readonly researchId: ResearchId
   readonly eventSeq: number
   readonly target: ResearchTargetSnapshot
   readonly context: ResearchContextSnapshot
+}
+
+/** Loading is a context handoff, never authority to resume work. */
+export interface ResearchLoadResult extends ResearchContextResult {
+  readonly mode: 'context-only' | 'recovery-only'
+  readonly goalAction: 'unchanged' | 'disarmed'
+  readonly briefing: 'queued'
+}
+
+export interface ResearchActivationResult extends ResearchContextResult {
   readonly goalAction: 'created' | 'updated' | 'resumed' | 'completed' | 'unchanged' | 'view-only' | 'recovery-only'
 }
 
-export interface ResearchCreateResult extends ResearchLoadResult {
+export interface ResearchStartResult {
+  readonly researchId: ResearchId
+  readonly target: ResearchTargetSnapshot
+  readonly goalAction: ResearchActivationResult['goalAction']
+}
+
+export interface ResearchCreateResult extends ResearchActivationResult {
   readonly created: true
 }
 
@@ -217,6 +331,7 @@ export interface ResearchStateResult {
 }
 
 export interface ResearchRunStartResult {
+  readonly planRef: PlanVersionRef
   readonly researchId: ResearchId
   readonly runId: RunId
   readonly path: string
@@ -224,6 +339,7 @@ export interface ResearchRunStartResult {
 }
 
 export interface ResearchRunFinishResult {
+  readonly planRef?: PlanVersionRef
   readonly researchId: ResearchId
   readonly runId: RunId
   readonly runStatus: 'completed' | 'failed'

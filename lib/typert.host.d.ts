@@ -2,7 +2,24 @@ export declare const TYPERT: {
     package: string;
     face: "host";
     schemas: never[];
-    invocations: {
+    invocations: (import("@deepseek-ai/dsh-typert-protocol").InvocationDescriptor | {
+        id: string;
+        service: string;
+        namespace: string;
+        method: string;
+        invocation: {
+            kind: "direct";
+        };
+        parameters: never[];
+        cancellation: {
+            parameter: "signal";
+        };
+        result: {
+            mode: "strict";
+            typeSymbol: string;
+            schema: import("zod").ZodType<import("./types.ts").ResearchViewClientConfig, unknown, import("zod/v4/core").$ZodTypeInternals<import("./types.ts").ResearchViewClientConfig, unknown>>;
+        };
+    } | {
         id: string;
         service: string;
         namespace: string;
@@ -28,7 +45,7 @@ export declare const TYPERT: {
             typeSymbol: string;
             schema: import("zod").ZodType<import("./types.ts").ResearchTargetList, unknown, import("zod/v4/core").$ZodTypeInternals<import("./types.ts").ResearchTargetList, unknown>>;
         };
-    }[];
+    })[];
     model: {
         services: {
             description: string;

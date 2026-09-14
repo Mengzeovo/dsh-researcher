@@ -82,7 +82,7 @@ export declare class GitCheckpointProvider {
     private validatePrepared;
     start(session: Session, researchId: string, runId: string, createdAt: string, reproduction: ReproductionSpec, signal?: AbortSignal): Promise<InputCheckpoint>;
     private artifacts;
-    finish(session: Session, input: InputCheckpoint, requestKey: string, prepared: Record<string, JsonValue>, signal?: AbortSignal, validate?: (value: FinishResult) => void): Promise<FinishResult>;
+    finish(session: Session, input: InputCheckpoint, requestKey: string, prepared: Record<string, JsonValue>, signal?: AbortSignal, validate?: (value: FinishResult) => void, beforeCapture?: () => Promise<void>): Promise<FinishResult>;
 }
 export {};
 //# sourceMappingURL=checkpoint.d.ts.map

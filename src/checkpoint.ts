@@ -9,6 +9,7 @@ import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { ResearcherError } from './errors.ts'
+import { preparedPlanRunResultSchema } from './schema.ts'
 import { createGitRunner, GIT_SAFETY_ARGS, gitEnvironment, type GitResult, type GitRunner } from './git-runtime.ts'
 
 export interface ReproductionSpec {
@@ -397,8 +398,11 @@ export class GitCheckpointProvider {
     if (commit === undefined) return undefined
     const stored = await this.readCommit(repo, commit)
     const body = jsonCopy(stored.body) as { version?: unknown; type?: unknown; requestKey?: unknown; checkpoint?: OutputBody; prepared?: Record<string, JsonValue> } | null
-    if (body === null || typeof body !== 'object' || body.version !== 1 || body.type !== 'dsh-research-output'
+    if (body === null || typeof body !== 'object' || (body.version !== 1 && body.version !== 2) || body.type !== 'dsh-research-output'
       || body.requestKey !== requestKey || !body.checkpoint || !body.prepared) invalid('output checkpoint request conflicts with immutable journal')
+    if ((body.version === 1 && body.prepared.version !== 1) || (body.version === 2 && body.prepared.version !== 3)) {
+      invalid('output checkpoint journal version does not match its prepared result')
+    }
     const cp = body.checkpoint
     if (cp.backend !== 'git' || cp.inputCommit !== input.inputCommit || cp.inputTree !== input.inputTree
       || cp.inputRef !== input.inputRef || cp.outputRef !== input.outputRef || cp.objectFormat !== repo.format
@@ -414,6 +418,13 @@ export class GitCheckpointProvider {
     return { checkpoint: { ...cp, outputCommit: commit }, prepared: body.prepared }
   }
   private validatePrepared(prepared: Record<string, JsonValue>): void {
+    if (prepared.version === 3) {
+      const parsed = preparedPlanRunResultSchema.safeParse(prepared)
+      if (!parsed.success) invalid('checkpoint requires the complete prepared plan result without a checkpoint', parsed.error)
+      return
+    }
+    // Keep historical provider validation unchanged; the coordinator validates
+    // legacy run/state records without rewriting an already-sealed transition.
     if (prepared.version !== 1 || prepared.type !== 'result' || typeof prepared.finishedAt !== 'string'
       || !Number.isFinite(Date.parse(prepared.finishedAt)) || (prepared.status !== 'completed' && prepared.status !== 'failed')
       || typeof prepared.result !== 'string' || typeof prepared.decision !== 'string'
@@ -486,7 +497,7 @@ export class GitCheckpointProvider {
     return { artifacts, stamps }
   }
 
-  async finish(session: Session, input: InputCheckpoint, requestKey: string, prepared: Record<string, JsonValue>, signal?: AbortSignal, validate?: (value: FinishResult) => void): Promise<FinishResult> {
+  async finish(session: Session, input: InputCheckpoint, requestKey: string, prepared: Record<string, JsonValue>, signal?: AbortSignal, validate?: (value: FinishResult) => void, beforeCapture?: () => Promise<void>): Promise<FinishResult> {
     try {
       const repo = await this.repo(session, signal)
       const frozenInput = jsonCopy(input)
@@ -499,6 +510,9 @@ export class GitCheckpointProvider {
       }
       const original = jsonCopy(prepared)
       this.validatePrepared(original)
+      // Only the first seal revalidates external plan bytes. Journal replay must
+      // remain possible after those bytes or artifact files are lost or changed.
+      await beforeCapture?.()
       await this.noMerge(repo)
       const captured = await this.capture(repo, frozenInput.files, new Set())
       const outputTree = await this.tree(repo, captured.entries)
@@ -509,7 +523,7 @@ export class GitCheckpointProvider {
         artifacts: digests.artifacts, codeChanged: outputTree !== frozenInput.inputTree,
       }
       const outputCommit = await this.commit(repo, outputTree, frozenInput.inputCommit,
-        message({ version: 1, type: 'dsh-research-output', requestKey, prepared: original, checkpoint: body }), original.finishedAt as string)
+        message({ version: original.version === 3 ? 2 : 1, type: 'dsh-research-output', requestKey, prepared: original, checkpoint: body }), original.finishedAt as string)
       validate?.(jsonCopy({ checkpoint: { ...body, outputCommit }, prepared: original }))
       await this.verify(repo, [...captured.stamps, ...digests.stamps])
       await this.noMerge(repo)

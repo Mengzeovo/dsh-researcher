@@ -6,7 +6,15 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { z } from 'zod'
 import { buildResearchContext } from './context.ts'
+import { notebookDirectories } from './notebook.ts'
 import { RecordStore, targetRoot, statePath, glossaryPath, runPath, sessionPath } from './record-store.ts'
+import { planContentInputSchema, planVersionRefSchema, type PlanVersionRef, type PlanRunBasisInput, type PlanRunEvidence } from './plan-schema.ts'
+import {
+  appendPlanLedgerText, formatPlanNumber, parsePlanDirectoryName, planContentMatches,
+  planDirectory, planLedgerEntry, planLedgerPath, planRoot, planVersionFile, planVersionPath,
+  renderPlanDocument, renderPlanLedger, verifyPlanLedgerDocument,
+} from './plan-records.ts'
+import { isCheckpointRunDescription, isCheckpointRunResult, samePlanVersionRef } from './types.ts'
 import { ResearcherError, invalidRecord } from './errors.ts'
 import { appendStateText, parseRunLog, renderClosedRun, renderOpenRun } from './jsonl.ts'
 import {
@@ -23,6 +31,7 @@ import {
   reproductionSchema,
   researchRunDescriptionSchema,
   researchRunResultSchema,
+  researchPreparedRunResultSchema,
   researchSessionIndexSchema,
   researchStateSchema,
   stableJsonLine,
@@ -30,6 +39,15 @@ import {
 } from './schema.ts'
 import type {
   CreateResearchRequest,
+  CreateResearchPlanRequest,
+  UpdateResearchPlanRequest,
+  GetResearchPlanRequest,
+  ListResearchPlansRequest,
+  SelectResearchPlanRequest,
+  ResearchPlanReadResult,
+  ResearchPlanListResult,
+  ResearchPlanSummary,
+  ResearchRunResult,
   FinishResearchRunRequest,
   ResearchBinding,
   ResearchGlossary,
@@ -102,13 +120,21 @@ function canonicalJson(value: JsonValue): string {
   return JSON.stringify(value)
 }
 
-function stateFieldsMatch(left: ResearchState, right: Omit<ResearchState, 'version' | 'revision' | 'at' | 'sessionId'>): boolean {
+function stateFieldsMatch(
+  left: ResearchState,
+  right: Pick<ResearchState, 'status' | 'summary' | 'direction' | 'next' | 'lastRunId'>,
+  selectedPlanRef?: PlanVersionRef,
+): boolean {
   return left.status === right.status
     && left.summary === right.summary
     && left.direction === right.direction
     && left.next === right.next
     && left.lastRunId === right.lastRunId
+    && samePlanVersionRef(left.selectedPlanRef, selectedPlanRef)
 }
+
+import { readResearchViewData } from './view-data.ts'
+import type { ResearchReadContext, ResearchViewConfig, ResearchViewData } from './view-types.ts'
 
 /** Research operation coordinator. Owns complete-operation locks and publication policy, not file I/O or Goal policy. */
 export class ResearchStore {
@@ -121,7 +147,7 @@ export class ResearchStore {
     this.records = new RecordStore(ctx)
   }
 
-  private async mutex(session: Session, id: ResearchId): Promise<FifoMutex> {
+  private async mutex(session: Session | ResearchReadContext, id: ResearchId): Promise<FifoMutex> {
     // Session cwd aliases must not create independent locks for the same target.
     const key = `${await this.records.canonicalWorkspace(session)}\u0000${id}`
     let mutex = this.mutexes.get(key)
@@ -130,6 +156,16 @@ export class ResearchStore {
       this.mutexes.set(key, mutex)
     }
     return mutex
+  }
+
+  /** Resolve the filesystem identity used by both writer locks and read-only views. */
+  async canonicalWorkspace(context: Session | ResearchReadContext): Promise<string> {
+    return await this.records.canonicalWorkspace(context)
+  }
+
+  /** Read graph records under the writer's target lock without creating a Session or Agent. */
+  async readViewData(context: ResearchReadContext, id: ResearchId, config: ResearchViewConfig, signal?: AbortSignal): Promise<ResearchViewData> {
+    return await (await this.mutex(context, id)).run(() => readResearchViewData(this.records, context, id, config, signal))
   }
 
   async createTarget(
@@ -146,7 +182,7 @@ export class ResearchStore {
       const markdown = renderGoalMarkdown(request.goal, request.metrics, request.baseline)
       const parsedGoal = parseGoalMarkdown(markdown)
       const state: ResearchState = researchStateSchema.parse({
-        version: 1,
+        version: 2,
         revision: 1,
         at,
         sessionId: String(session.id),
@@ -179,6 +215,7 @@ export class ResearchStore {
         stagingRoot,
         `${stagingRoot}/session`,
         `${stagingRoot}/runs`,
+        ...Object.values(notebookDirectories(stagingRoot)),
       ]
       const policy = await this.records.ensureDirectories(session, directories)
       try {
@@ -228,15 +265,43 @@ export class ResearchStore {
         invalidRecord(`${statePath(id)} lastRunId ${state.lastRunId} refers to an open run`)
       }
     }
+    let selectedPlan: ResearchTargetSnapshot['selectedPlan']
+    if (state.selectedPlanRef !== undefined) {
+      try {
+        const selected = await this.verifyPlanRef(session, id, state.selectedPlanRef, signal)
+        selectedPlan = { ref: state.selectedPlanRef, title: selected.plan.metadata.title, path: selected.path }
+        warnings.push(...selected.warnings)
+      } catch (error) {
+        if (signal?.aborted) throw error
+        warnings.push('Selected plan integrity error: ' + (error instanceof Error ? error.message : String(error)))
+      }
+    }
+    const recovery = await this.readRecovery(session, id, state.revision, signal)
+    const checked = new Set(state.selectedPlanRef === undefined ? [] : [JSON.stringify(state.selectedPlanRef)])
+    const runRefs = [
+      ...(latestRun?.description.version === 3 ? [{ runId: latestRun.id, ref: latestRun.description.planRef }] : []),
+      ...(recovery?.planRef === undefined ? [] : [{ runId: recovery.runId, ref: recovery.planRef }]),
+    ]
+    for (const item of runRefs) {
+      const key = JSON.stringify(item.ref)
+      if (checked.has(key)) continue
+      checked.add(key)
+      try { await this.verifyPlanRef(session, id, item.ref, signal) }
+      catch (error) {
+        if (signal?.aborted) throw error
+        warnings.push('Run ' + item.runId + ' plan integrity error: ' + (error instanceof Error ? error.message : String(error)))
+      }
+    }
     return {
       id,
       root,
-      goalPath: `${root}/goal.md`,
+      goalPath: targetRoot(id) + '/goal.md',
       goal,
       state,
       glossary,
+      ...(selectedPlan === undefined ? {} : { selectedPlan }),
       ...(latestRun === undefined ? {} : { latestRun }),
-      recovery: await this.readRecovery(session, id, state.revision, signal),
+      recovery,
       warnings,
     }
   }
@@ -279,6 +344,192 @@ export class ResearchStore {
     return { targets, invalid }
   }
 
+  async createPlan(session: Session, idInput: ResearchId | string, request: CreateResearchPlanRequest, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    const id = parseResearchId(idInput)
+    const input = planContentInputSchema.parse(request)
+    if ((input.basedOnRuns?.length ?? 0) !== 0) throw new ResearcherError('initial plans cannot cite experiment evidence', 'RESEARCH_PLAN_EVIDENCE')
+    return await (await this.mutex(session, id)).run(async () => {
+      const target = await this.readTarget(session, id, signal)
+      if (target.state.status === 'complete') throw new ResearcherError('completed targets cannot create plans', 'RESEARCH_TARGET_COMPLETE')
+      this.records.writePolicy(session)
+      const entries = await this.records.listPlanEntries(session, id, signal)
+      let maximum = 0
+      for (const entry of entries) {
+        const number = parsePlanDirectoryName(entry.name)
+        if (number === undefined) continue
+        if (entry.type !== 'directory') throw new ResearcherError('numeric plan path is not a directory: ' + entry.name, 'RESEARCH_PATH_INVALID')
+        maximum = Math.max(maximum, number)
+      }
+      const planId = maximum + 1
+      formatPlanNumber(planId)
+      const document = renderPlanDocument(planId, 1, input, nowIso())
+      const root = planRoot(id)
+      const finalRoot = planDirectory(id, planId)
+      const staging = root + '/.creating-' + formatPlanNumber(planId) + '-' + randomUUID()
+      const policy = await this.records.ensureDirectories(session, [root, staging])
+      let published = false
+      try {
+        await this.records.createText(session, staging + '/' + planVersionFile(1), document.markdown, policy, signal)
+        await this.records.createText(session, staging + '/versions.jsonl', renderPlanLedger([planLedgerEntry(document)]), policy, signal)
+        await this.records.commitDirectory(session, staging, finalRoot)
+        published = true
+        return await this.readPlanLocked(session, id, { planId, revision: 1 }, signal)
+      } catch (error) {
+        if (!published) await this.records.discardStaging(session, staging).catch(cleanup => this.logger.warn('failed to discard plan staging %s: %s', staging, String(cleanup)))
+        throw new ResearcherError('plan ' + planId + (published ? ' was published; inspect ' : ' creation failed; inspect ') + finalRoot + ' before creating again: ' + String(error), error instanceof ResearcherError ? error.code : 'RESEARCH_INVALID_RECORD', { cause: error })
+      }
+    })
+  }
+
+  async getPlan(session: Session, idInput: ResearchId | string, request: GetResearchPlanRequest, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    const id = parseResearchId(idInput)
+    return await (await this.mutex(session, id)).run(async () => await this.readPlanLocked(session, id, request, signal))
+  }
+
+  private async readPlanLocked(session: Session, id: ResearchId, request: GetResearchPlanRequest, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    formatPlanNumber(request.planId)
+    const ledger = (await this.records.readPlanLedger(session, id, request.planId, signal)).value
+    const latest = ledger.entries.at(-1)
+    if (latest === undefined) invalidRecord('plan ' + request.planId + ' has no committed versions')
+    const revision = request.revision ?? latest.revision
+    formatPlanNumber(revision)
+    const entry = ledger.entries.find(item => item.revision === revision)
+    if (entry === undefined) throw new ResearcherError('plan ' + request.planId + ' revision ' + revision + ' is not committed', 'RESEARCH_NOT_FOUND')
+    const document = (await this.records.readPlanDocument(session, id, request.planId, revision, signal)).value
+    verifyPlanLedgerDocument(document, entry)
+    if (document.metadata.schema_version === 2 && document.metadata.based_on_runs.length !== 0) {
+      const recorded = document.metadata.based_on_runs
+      const actual = await this.resolvePlanEvidence(session, id, request.planId, revision, recorded.map(item => ({ runId: item.run_id, reason: item.reason })), signal)
+      if (!isDeepStrictEqual(actual, recorded)) throw new ResearcherError('sealed experiment evidence digest differs from the plan version', 'RESEARCH_PLAN_INTEGRITY')
+    }
+    const registered = new Set(ledger.entries.map(item => item.file))
+    const warnings: string[] = []
+    for (const file of await this.records.listPlanFiles(session, id, request.planId, signal)) {
+      if (/^v.*\.md$/u.test(file.name) && !registered.has(file.name)) warnings.push('Uncommitted plan file (never selected as latest): ' + planDirectory(id, request.planId) + '/' + file.name)
+    }
+    return { researchId: id, plan: document, path: planVersionPath(id, request.planId, revision), latestRevision: latest.revision, warnings }
+  }
+
+  async listPlans(session: Session, idInput: ResearchId | string, request: ListResearchPlansRequest = {}, signal?: AbortSignal): Promise<ResearchPlanListResult> {
+    const id = parseResearchId(idInput)
+    const afterId = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(request.afterId ?? 0)
+    const limit = z.number().int().min(1).max(100).parse(request.limit ?? 50)
+    return await (await this.mutex(session, id)).run(async () => {
+      await this.records.readStateLog(session, id, signal)
+      const entries = (await this.records.listPlanEntries(session, id, signal))
+        .map(entry => ({ entry, planId: parsePlanDirectoryName(entry.name) }))
+        .filter((item): item is { entry: typeof item.entry; planId: number } => item.planId !== undefined && item.planId > afterId)
+        .sort((left, right) => left.planId - right.planId)
+      const page = entries.slice(0, limit)
+      const plans: ResearchPlanSummary[] = []
+      const invalid: { planId: number; code: string; detail: string }[] = []
+      for (const { entry, planId } of page) {
+        try {
+          if (entry.type !== 'directory') throw new ResearcherError('plan path is not a directory', 'RESEARCH_PATH_INVALID')
+          const value = await this.readPlanLocked(session, id, { planId }, signal)
+          plans.push({ planId, latestRevision: value.latestRevision, title: truncateLabel(value.plan.metadata.title), createdAt: value.plan.metadata.created_at, sha256: value.plan.sha256, path: value.path })
+        } catch (error) {
+          invalid.push({ planId, code: error instanceof ResearcherError ? error.code : 'RESEARCH_INVALID_RECORD', detail: this.shortError(error) })
+        }
+      }
+      return { researchId: id, plans, invalid, ...(entries.length > limit ? { nextAfterId: page.at(-1)!.planId } : {}) }
+    })
+  }
+
+  async updatePlan(session: Session, idInput: ResearchId | string, request: UpdateResearchPlanRequest, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    const id = parseResearchId(idInput)
+    formatPlanNumber(request.planId)
+    formatPlanNumber(request.expectedRevision)
+    const input = planContentInputSchema.parse({ title: request.title, body: request.body, delta: request.delta, basedOnRuns: request.basedOnRuns })
+    return await (await this.mutex(session, id)).run(async () => {
+      const target = await this.readTarget(session, id, signal)
+      const ledgerFile = await this.records.readPlanLedger(session, id, request.planId, signal)
+      const ledger = ledgerFile.value
+      const latest = ledger.entries.at(-1)
+      if (latest === undefined) invalidRecord('plan has no committed versions')
+      for (const entry of ledger.entries) {
+        verifyPlanLedgerDocument((await this.records.readPlanDocument(session, id, request.planId, entry.revision, signal)).value, entry)
+      }
+      if (latest.revision === request.expectedRevision + 1) {
+        const committed = await this.readPlanLocked(session, id, { planId: request.planId, revision: latest.revision }, signal)
+        if (planContentMatches(committed.plan, input)) return committed
+      }
+      if (latest.revision !== request.expectedRevision) throw new ResearcherError('plan latest revision is ' + latest.revision + ', expected ' + request.expectedRevision, 'RESEARCH_STALE_WRITE')
+      if (target.state.status === 'complete') throw new ResearcherError('completed targets cannot revise plans', 'RESEARCH_TARGET_COMPLETE')
+      const policy = this.records.writePolicy(session)
+      const revision = request.expectedRevision + 1
+      const nextFile = planVersionFile(revision)
+      const registered = new Set(ledger.entries.map(entry => entry.file))
+      for (const entry of await this.records.listPlanFiles(session, id, request.planId, signal)) {
+        if (/^v.*\.md$/u.test(entry.name) && !registered.has(entry.name) && (entry.name !== nextFile || entry.type !== 'file')) {
+          throw new ResearcherError('conflicting uncommitted plan file: ' + entry.name + '; preserve it and inspect before retrying', 'RESEARCH_PLAN_CONFLICT')
+        }
+      }
+      const pending = await this.records.findPlanDocument(session, id, request.planId, revision, signal)
+      const evidence = await this.resolvePlanEvidence(session, id, request.planId, revision, input.basedOnRuns ?? [], signal)
+      const document = pending?.value ?? renderPlanDocument(request.planId, revision, input, nowIso(), evidence)
+      if (pending !== undefined && !planContentMatches(document, input)) throw new ResearcherError('uncommitted next plan version differs from this update; retry the original payload', 'RESEARCH_PLAN_CONFLICT')
+      if (document.metadata.schema_version === 2 && !isDeepStrictEqual(document.metadata.based_on_runs, evidence)) throw new ResearcherError('uncommitted plan evidence no longer matches its sealed experiments', 'RESEARCH_PLAN_INTEGRITY')
+      if (pending === undefined) await this.records.createText(session, planVersionPath(id, request.planId, revision), document.markdown, policy, signal)
+      await this.records.replaceText(session, ledgerFile, planLedgerPath(id, request.planId), appendPlanLedgerText(ledger, planLedgerEntry(document)), signal)
+      return await this.readPlanLocked(session, id, { planId: request.planId, revision }, signal)
+    })
+  }
+
+  /** Call under the target mutex; evidence only points to committed, earlier versions. */
+  private async resolvePlanEvidence(
+    session: Session, id: ResearchId, planId: number, revision: number,
+    basis: readonly PlanRunBasisInput[], signal?: AbortSignal,
+  ): Promise<readonly PlanRunEvidence[]> {
+    if (basis.length === 0) return []
+    const states = (await this.records.readStateLog(session, id, signal)).value.states
+    const ledger = (await this.records.readPlanLedger(session, id, planId, signal)).value
+    const evidence: PlanRunEvidence[] = []
+    for (const item of basis) {
+      const file = await this.records.readRun(session, id, parseRunId(item.runId), signal)
+      const run = file.value
+      if (run.description.version !== 3 || run.description.planRef.planId !== planId || run.description.planRef.revision >= revision) {
+        throw new ResearcherError('experiment evidence must use an earlier revision of the same plan', 'RESEARCH_PLAN_EVIDENCE')
+      }
+      if (run.result === undefined || !states.some(state => isDeepStrictEqual(state, run.result!.transition))) {
+        throw new ResearcherError('experiment evidence must be sealed with its state transition committed', 'RESEARCH_PLAN_EVIDENCE')
+      }
+      const ref = run.description.planRef
+      const entry = ledger.entries.find(value => value.revision === ref.revision)
+      if (entry === undefined || entry.sha256 !== ref.sha256) throw new ResearcherError('experiment evidence has an unverified plan reference', 'RESEARCH_PLAN_INTEGRITY')
+      const plan = (await this.records.readPlanDocument(session, id, planId, ref.revision, signal)).value
+      verifyPlanLedgerDocument(plan, entry)
+      evidence.push({ run_id: run.id, reason: item.reason, sha256: createHash('sha256').update(file.text, 'utf8').digest('hex') })
+    }
+    return evidence
+  }
+
+  async selectPlan(session: Session, idInput: ResearchId | string, request: SelectResearchPlanRequest, signal?: AbortSignal): Promise<ResearchStateResult> {
+    const id = parseResearchId(idInput)
+    formatPlanNumber(request.expectedStateRevision)
+    return await (await this.mutex(session, id)).run(async () => {
+      const target = await this.readTarget(session, id, signal)
+      const stateFile = await this.records.readStateLog(session, id, signal)
+      const current = stateFile.value.states.at(-1)!
+      if (!isDeepStrictEqual(current, target.state) || current.revision !== request.expectedStateRevision) throw new ResearcherError('research state changed before plan selection', 'RESEARCH_STALE_WRITE')
+      if (current.status === 'complete') throw new ResearcherError('completed targets cannot select plans', 'RESEARCH_TARGET_COMPLETE')
+      if (target.recovery !== undefined) throw new ResearcherError('finish run ' + target.recovery.runId + ' before changing the selected plan', 'RESEARCH_RUN_OPEN')
+      const selected = await this.readPlanLocked(session, id, request, signal)
+      const ref = planVersionRefSchema.parse({ planId: request.planId, revision: request.revision, sha256: selected.plan.sha256 })
+      if (samePlanVersionRef(current.selectedPlanRef, ref)) return { researchId: id, state: current, path: statePath(id) }
+      const state = researchStateSchema.parse({ ...current, version: 2, revision: current.revision + 1, at: nowIso(), sessionId: String(session.id), selectedPlanRef: ref })
+      assertContextFits(session, { ...target, state, selectedPlan: { ref, title: selected.plan.metadata.title, path: selected.path } }, state.at)
+      await this.records.replaceText(session, stateFile, statePath(id), appendStateText(stateFile.value, state), signal)
+      return { researchId: id, state, path: statePath(id) }
+    })
+  }
+
+  private async verifyPlanRef(session: Session, id: ResearchId, ref: PlanVersionRef, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    const value = await this.readPlanLocked(session, id, ref, signal)
+    if (value.plan.sha256 !== ref.sha256) throw new ResearcherError('pinned plan digest differs from its committed version: ' + value.path, 'RESEARCH_PLAN_INTEGRITY')
+    return value
+  }
+
   async appendState(
     session: Session,
     idInput: ResearchId | string,
@@ -314,7 +565,7 @@ export class ResearchStore {
       )
     }
     const checkpointRun = await this.findOpenRun(session, id, signal)
-    if (checkpointRun !== undefined && (await this.readRun(session, id, checkpointRun, signal)).description.version === 2) {
+    if (checkpointRun !== undefined && isCheckpointRunDescription((await this.readRun(session, id, checkpointRun, signal)).description)) {
       throw new ResearcherError(`research run ${checkpointRun} freezes state until finish publishes its checkpoint`, 'RESEARCH_RUN_OPEN')
     }
     if (request.status === 'complete') {
@@ -332,7 +583,7 @@ export class ResearchStore {
       if (latestRun.result === undefined) invalidRecord(`lastRunId ${request.lastRunId} refers to an open run`)
     }
     const state = researchStateSchema.parse({
-      version: 1,
+      version: 2,
       revision: current.revision + 1,
       at: nowIso(),
       sessionId: String(session.id),
@@ -341,6 +592,7 @@ export class ResearchStore {
       ...(request.direction === undefined ? {} : { direction: request.direction }),
       ...(request.next === undefined ? {} : { next: request.next }),
       ...(request.lastRunId === undefined ? {} : { lastRunId: request.lastRunId }),
+      ...(current.selectedPlanRef === undefined ? {} : { selectedPlanRef: current.selectedPlanRef }),
     })
     const prospective: ResearchTargetSnapshot = {
       id: target.id,
@@ -387,7 +639,7 @@ export class ResearchStore {
       }
       if (target.state.status !== 'active') {
         throw new ResearcherError(
-          `research target ${id} is ${target.state.status}; use /research-load ${id} to recover or resume it before starting a run`,
+          `research target ${id} is ${target.state.status}; load context with /research-load ${id}; resume state only with explicit authorization (use /research-start for continuous work) before starting a run`,
           'RESEARCH_TARGET_INACTIVE',
         )
       }
@@ -405,6 +657,11 @@ export class ResearchStore {
           'RESEARCH_RUN_OPEN',
         )
       }
+      const requestedPlan = z.object({ planId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict().safeParse(request.plan)
+      const selected = target.state.selectedPlanRef
+      if (!requestedPlan.success || selected === undefined) throw new ResearcherError('save and explicitly select a plan before every new run; provide its exact plan_id and revision', 'RESEARCH_PLAN_REQUIRED')
+      if (requestedPlan.data.planId !== selected.planId || requestedPlan.data.revision !== selected.revision) throw new ResearcherError('run plan does not match the selected research plan; select the intended version first', 'RESEARCH_PLAN_CONFLICT')
+      await this.verifyPlanRef(session, id, selected, signal)
       const policy = this.records.writePolicy(session)
       const reproduction = reproductionSchema.parse(request.reproduction)
       const runId = parseRunId(randomUUID())
@@ -417,11 +674,11 @@ export class ResearchStore {
         parameters: cloneJsonRecord(request.parameters),
       })
       // Reject oversized caller material before creating any Git objects/refs.
-      stableJsonLine({ ...base, reproduction })
+      stableJsonLine({ ...base, reproduction, planRef: selected })
       const checkpoint = await this.checkpoints.start(session, id, runId, base.createdAt, reproduction, signal)
       try {
         const description = researchRunDescriptionSchema.parse({
-          ...base, version: 2, baseStateRevision: target.state.revision, checkpoint,
+          ...base, version: 3, baseStateRevision: target.state.revision, checkpoint, planRef: selected,
         })
         await this.records.createText(session, runPath(id, runId), renderOpenRun(description), policy, signal)
       } catch (error) {
@@ -433,7 +690,7 @@ export class ResearchStore {
       await this.ensureSessionIndex(session, id, signal).catch(error => {
         this.logger.warn('run %s was created but its rebuildable session index was not updated: %s', runId, String(error))
       })
-      return { researchId: id, runId, path: runPath(id, runId), checkpoint }
+      return { researchId: id, runId, path: runPath(id, runId), checkpoint, planRef: selected }
     })
   }
 
@@ -443,112 +700,100 @@ export class ResearchStore {
     request: FinishResearchRunRequest,
     signal?: AbortSignal,
   ): Promise<ResearchRunFinishResult> {
-    const id = typeof idInput === 'string' ? parseResearchId(idInput) : idInput
+    const id = parseResearchId(idInput)
     return await (await this.mutex(session, id)).run(async () => {
       const runFile = await this.records.readRun(session, id, request.runId, signal)
       const run = runFile.value
       this.records.writePolicy(session)
       const metrics = cloneJsonRecord(request.metrics)
+      // Keep the legacy request-key shape unchanged. Selection is Host-owned, never a finish argument.
       const requestedState = {
-        status: request.researchStatus,
-        summary: request.summary,
+        status: request.researchStatus, summary: request.summary,
         ...(request.direction === undefined ? {} : { direction: request.direction }),
         ...(request.next === undefined ? {} : { next: request.next }),
         lastRunId: request.runId,
       } as const
-
       let closedRun: ResearchRun
       if (run.result !== undefined) {
         const artifacts = this.normalizeArtifactPaths(request.artifacts)
-        if (run.result.status !== request.status
-          || run.result.result !== request.result
-          || !isDeepStrictEqual(run.result.metrics, metrics)
-          || run.result.decision !== request.decision
+        const selection = run.description.version === 3 ? run.description.planRef : run.result.transition.selectedPlanRef
+        if (run.result.status !== request.status || run.result.result !== request.result
+          || !isDeepStrictEqual(run.result.metrics, metrics) || run.result.decision !== request.decision
           || !isDeepStrictEqual(run.result.artifacts, artifacts)
-          || !stateFieldsMatch(run.result.transition, requestedState)) {
-          throw new ResearcherError(`run ${request.runId} is already closed with a different immutable result or transition`, 'RESEARCH_RUN_CLOSED')
+          || !stateFieldsMatch(run.result.transition, requestedState, selection)) {
+          throw new ResearcherError('run ' + request.runId + ' is already closed with a different immutable result or transition', 'RESEARCH_RUN_CLOSED')
         }
         closedRun = run
       } else {
         const currentTarget = await this.readTarget(session, id, signal)
-        if (currentTarget.state.status === 'complete') {
-          throw new ResearcherError(`research target ${id} is complete`, 'RESEARCH_TARGET_COMPLETE')
-        }
+        if (currentTarget.state.status === 'complete') throw new ResearcherError('research target ' + id + ' is complete', 'RESEARCH_TARGET_COMPLETE')
         const openRun = await this.findOpenRun(session, id, signal)
-        if (openRun !== request.runId) {
-          throw new ResearcherError(
-            openRun === undefined
-              ? `run ${request.runId} is not the target's open run`
-              : `research run ${openRun} is the target's open run`,
-            'RESEARCH_RUN_OPEN',
-          )
-        }
-        if (run.description.version === 2 && currentTarget.state.revision !== run.description.baseStateRevision) {
+        if (openRun !== request.runId) throw new ResearcherError('run ' + request.runId + ' is not the target open run (' + (openRun ?? 'none') + ')', 'RESEARCH_RUN_OPEN')
+        if (isCheckpointRunDescription(run.description) && currentTarget.state.revision !== run.description.baseStateRevision) {
           throw new ResearcherError('state changed after the run input checkpoint; refusing a stale finish', 'RESEARCH_STALE_WRITE')
         }
-        const artifacts = run.description.version === 2
+        const planRef = run.description.version === 3 ? run.description.planRef : undefined
+        const selection = planRef ?? currentTarget.state.selectedPlanRef
+        if (planRef !== undefined && !samePlanVersionRef(currentTarget.state.selectedPlanRef, planRef)) throw new ResearcherError('selected plan changed after the run started', 'RESEARCH_STALE_WRITE')
+        const artifacts = isCheckpointRunDescription(run.description)
           ? this.normalizeArtifactPaths(request.artifacts)
           : await this.validateArtifacts(session, request.artifacts, signal)
         const transition = researchStateSchema.parse({
-          version: 1,
-          revision: currentTarget.state.revision + 1,
-          at: nowIso(),
-          sessionId: String(session.id),
-          ...requestedState,
+          version: 2, revision: currentTarget.state.revision + 1, at: nowIso(), sessionId: String(session.id),
+          ...requestedState, ...(selection === undefined ? {} : { selectedPlanRef: selection }),
         })
-        let result = researchRunResultSchema.parse({
-          version: 1,
-          type: 'result',
-          finishedAt: nowIso(),
-          status: request.status,
-          result: request.result,
-          metrics,
-          decision: request.decision,
-          artifacts,
-          transition,
+        const prepared = researchPreparedRunResultSchema.parse({
+          version: planRef === undefined ? 1 : 3, type: 'result', finishedAt: nowIso(),
+          status: request.status, result: request.result, metrics, decision: request.decision, artifacts, transition,
+          ...(planRef === undefined ? {} : { planRef }),
         })
-        // Preflight caller state before any durable checkpoint publication.
-        assertContextFits(session, { ...currentTarget, recovery: undefined, state: transition, latestRun: { ...run, result } }, transition.at)
-        stableJsonLine(result)
-        if (run.description.version === 2) {
-          const input = run.description.checkpoint
+        // No partial checkpoint result is fabricated for this mandatory-state preflight.
+        assertContextFits(session, { ...currentTarget, recovery: undefined, state: transition }, transition.at)
+        stableJsonLine(prepared)
+        let result: ResearchRunResult
+        if (isCheckpointRunDescription(run.description)) {
+          const description = run.description
           const requestKey = createHash('sha256').update(canonicalJson({
             status: request.status, result: request.result, metrics: { ...metrics },
-            decision: request.decision, artifacts, transition: { ...requestedState },
+            decision: request.decision, artifacts,
+            transition: { ...requestedState, ...(planRef === undefined ? {} : { selectedPlanRef: { ...planRef } }) },
+            ...(planRef === undefined ? {} : { planRef: { ...planRef } }),
           })).digest('hex')
+          const frozenResult = (sealed: Awaited<ReturnType<GitCheckpointProvider['finish']>>) => {
+            if (sealed.prepared.version !== (description.version === 3 ? 3 : 1)) throw new ResearcherError('checkpoint journal prepared version disagrees with the run', 'RESEARCH_CHECKPOINT_INVALID')
+            return researchRunResultSchema.parse({ ...sealed.prepared, version: description.version, checkpoint: sealed.checkpoint })
+          }
           const validate = (sealed: Awaited<ReturnType<GitCheckpointProvider['finish']>>) => {
-            const frozen = researchRunResultSchema.parse({ ...sealed.prepared, version: 2, checkpoint: sealed.checkpoint })
+            const frozen = frozenResult(sealed)
             if (frozen.status !== request.status || frozen.result !== request.result
               || !isDeepStrictEqual(frozen.metrics, metrics) || frozen.decision !== request.decision
-              || !isDeepStrictEqual(frozen.artifacts, artifacts) || !stateFieldsMatch(frozen.transition, requestedState)
+              || !isDeepStrictEqual(frozen.artifacts, artifacts) || !stateFieldsMatch(frozen.transition, requestedState, selection)
               || frozen.transition.revision !== currentTarget.state.revision + 1) {
               throw new ResearcherError('checkpoint journal disagrees with the exact finish payload or state', 'RESEARCH_CHECKPOINT_INVALID')
             }
-            // Parsing validates checkpoint ownership, record pairing and the frozen base revision.
-            parseRunLog(request.runId, renderClosedRun(run.description, frozen))
+            parseRunLog(request.runId, renderClosedRun(description, frozen))
             assertContextFits(session, { ...currentTarget, recovery: undefined, state: frozen.transition, latestRun: { ...run, result: frozen } }, frozen.transition.at)
           }
-          const sealed = await this.checkpoints.finish(session, input, requestKey,
-            JSON.parse(stableJsonLine(result)) as Record<string, JsonValue>, signal, validate)
+          const sealed = await this.checkpoints.finish(session, description.checkpoint, requestKey,
+            JSON.parse(stableJsonLine(prepared)) as Record<string, JsonValue>, signal, validate,
+            planRef === undefined ? undefined : async () => { await this.verifyPlanRef(session, id, planRef, signal) })
           validate(sealed)
-          result = researchRunResultSchema.parse({ ...sealed.prepared, version: 2, checkpoint: sealed.checkpoint })
+          result = frozenResult(sealed)
+        } else {
+          result = researchRunResultSchema.parse(prepared)
         }
         closedRun = { ...run, result }
-        const closedText = renderClosedRun(run.description, result)
-        await this.records.replaceText(session, runFile, runPath(id, request.runId), closedText, signal)
+        await this.records.replaceText(session, runFile, runPath(id, request.runId), renderClosedRun(run.description, result), signal)
       }
-
       const state = await this.appendPreparedRunState(session, id, closedRun, signal)
       await this.ensureSessionIndex(session, id, signal).catch(error => {
         this.logger.warn('run %s finished but its rebuildable session index was not updated: %s', request.runId, String(error))
       })
       return {
-        researchId: id,
-        runId: request.runId,
-        runStatus: closedRun.result!.status,
-        ...(closedRun.result?.version === 2 ? { checkpoint: closedRun.result.checkpoint } : {}),
-        state,
-        path: runPath(id, request.runId),
+        researchId: id, runId: request.runId, runStatus: closedRun.result!.status,
+        ...(isCheckpointRunResult(closedRun.result!) ? { checkpoint: closedRun.result!.checkpoint } : {}),
+        ...(closedRun.description.version === 3 ? { planRef: closedRun.description.planRef } : {}),
+        state, path: runPath(id, request.runId),
       }
     })
   }
@@ -719,7 +964,8 @@ export class ResearchStore {
       }
       recovery = {
         runId, phase, path: runPath(id, runId),
-        ...(run.description.version === 2 ? { outputRef: run.description.checkpoint.outputRef } : {}),
+        ...(isCheckpointRunDescription(run.description) ? { outputRef: run.description.checkpoint.outputRef } : {}),
+        ...(run.description.version === 3 ? { planRef: run.description.planRef } : {}),
       }
     }
     return recovery

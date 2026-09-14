@@ -1,6 +1,8 @@
 import type { RemoteResult, TypertRemoteContribution } from '@deepseek-ai/dsh-typert-protocol'
 import { researchTargetListRequestSchema, researchTargetListSchema } from './wire.ts'
-import type { ResearchTargetList, ResearchTargetListRequest } from './types.ts'
+import type { ResearchTargetList, ResearchTargetListRequest, ResearchViewClientConfig } from './types.ts'
+
+import { viewConfigInvocation } from './view-config-invocation.ts'
 
 const descriptor = {
   id: 'dsh-profile-researcher#researcher/list',
@@ -30,10 +32,12 @@ const descriptor = {
 
 declare module '@deepseek-ai/dsh-typert-protocol' {
   interface TypertRemoteNamespace$72657365617263686572 {
+    getViewConfig: (signal?: AbortSignal) => Promise<RemoteResult<ResearchViewClientConfig>>
     list: (request: ResearchTargetListRequest, signal?: AbortSignal) => Promise<RemoteResult<ResearchTargetList>>
   }
 
   interface TypertRemoteMap {
+    'researcher/getViewConfig': (signal?: AbortSignal) => Promise<RemoteResult<ResearchViewClientConfig>>
     'researcher/list': (request: ResearchTargetListRequest, signal?: AbortSignal) => Promise<RemoteResult<ResearchTargetList>>
   }
 
@@ -44,7 +48,7 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
 
 export const TYPERT_REMOTE = {
   package: 'dsh-profile-researcher',
-  descriptors: [descriptor],
+  descriptors: [descriptor, viewConfigInvocation],
 } satisfies TypertRemoteContribution
 
 export default TYPERT_REMOTE

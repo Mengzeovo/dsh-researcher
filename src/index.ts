@@ -1,4 +1,4 @@
-/** Host researcher service: project-file authority, session binding, and Goal activation. */
+/** Host researcher service: project-file authority, context-only loading, and explicit Goal activation. */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { type Agent } from '@deepseek-ai/dsh-agent'
@@ -20,17 +20,29 @@ import {
   researchGoalObjective,
 } from './context.ts'
 import { ResearcherError } from './errors.ts'
+import { ResearchBriefings } from './briefing.ts'
+import { assertSessionEventAccess, sessionEventAt, sessionNextSeq } from './session-events.ts'
 import { nowIso, parseResearchId, researchBindingSchema, researchTargetListRequestSchema } from './schema.ts'
 import { ResearchStore } from './research-store.ts'
 import type {
   CreateResearchRequest,
+  CreateResearchPlanRequest,
+  UpdateResearchPlanRequest,
+  GetResearchPlanRequest,
+  ListResearchPlansRequest,
+  SelectResearchPlanRequest,
+  ResearchPlanReadResult,
+  ResearchPlanListResult,
   FinishResearchRunRequest,
   ResearchBinding,
   ResearchCreateResult,
   ResearchGlossaryPatch,
   ResearchGlossaryResult,
   ResearchId,
+  ResearchViewClientConfig,
   ResearchLoadResult,
+  ResearchActivationResult,
+  ResearchStartResult,
   ResearchReadResult,
   ResearchRunFinishResult,
   ResearchRunStartResult,
@@ -42,12 +54,20 @@ import type {
   UpdateResearchRequest,
 } from './types.ts'
 
+import { resolveResearcherConfig, researcherConfigSchema } from './view-config.ts'
+import ResearchViewService from './view-service.ts'
+import type { ResearchReadContext, ResearchViewConfig, ResearchViewData } from './view-types.ts'
+
+export interface ResearcherBindingProjectionView { readonly binding: ResearchBinding | null; readonly failure: string | null }
+
 export interface ResearcherBindingProjectionState {
+  readonly sessionId: string
   readonly bindings: Readonly<Record<string, ResearchBinding>>
   readonly failure: string | null
 }
 
 const researcherBindingProjectionSchema: z.ZodType<ResearcherBindingProjectionState> = z.object({
+  sessionId: z.string().min(1),
   bindings: z.record(z.string(), researchBindingSchema).superRefine((bindings, ctx) => {
     for (const [sessionId, binding] of Object.entries(bindings)) {
       if (binding.sessionId !== sessionId) {
@@ -59,6 +79,7 @@ const researcherBindingProjectionSchema: z.ZodType<ResearcherBindingProjectionSt
 }).strict()
 
 declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionMap { researcherBinding: ResearcherBindingProjectionView }
   interface SessionProjectionStateMap {
     researcherBinding: ResearcherBindingProjectionState
   }
@@ -67,6 +88,10 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     researcher: ResearcherService
+  }
+  interface Events {
+    /** @mode broadcast @param value - A successfully committed target mutation. */
+    'researcher/changed'(value: { readonly workspaceRoot: string; readonly researchId: ResearchId }): void
   }
 }
 
@@ -95,6 +120,7 @@ export function applyResearcherBindingProjection(
       }
     }
     next = {
+      sessionId: state.sessionId,
       bindings: { ...next.bindings, [binding.sessionId]: binding },
       failure: null,
     }
@@ -102,12 +128,26 @@ export function applyResearcherBindingProjection(
   return next
 }
 
+const bindingWireViews = new WeakMap<ResearcherBindingProjectionState, ResearcherBindingProjectionView>()
+function bindingWireView(state: ResearcherBindingProjectionState): ResearcherBindingProjectionView {
+  let value = bindingWireViews.get(state)
+  if (value === undefined) {
+    value = { binding: state.bindings[state.sessionId] ?? null, failure: state.failure }
+    bindingWireViews.set(state, value)
+  }
+  return value
+}
+
 export const researcherBindingProjectionDefinition = {
   key: 'researcherBinding',
-  stateVersion: 1,
+  stateVersion: 2,
   stateSchema: researcherBindingProjectionSchema,
-  init: (): ResearcherBindingProjectionState => ({ bindings: {}, failure: null }),
+  init: (header: import('@deepseek-ai/dsh-session').SessionHeader): ResearcherBindingProjectionState => ({ sessionId: String(header.id), bindings: {}, failure: null }),
   apply: applyResearcherBindingProjection,
+  wire: {
+    viewSchema: z.object({ binding: researchBindingSchema.nullable(), failure: z.string().nullable() }).strict(),
+    view: bindingWireView,
+  },
 } satisfies ProjectionDefinition<'researcherBinding', ResearcherBindingProjectionState>
 
 function goalRef(goal: GoalView): { id: GoalView['id']; revision: number } {
@@ -137,13 +177,45 @@ class SerialGate {
 export class ResearcherService extends TypertRemoteService {
   static inject = ['agents', 'fs', 'goals', 'sandbox', 'sandboxPolicy', 'sessionProjections', 'subprocess']
 
+  private readonly viewConfig: ResearchViewClientConfig
   private readonly store: ResearchStore
   private readonly activationGates = new WeakMap<Session, SerialGate>()
+  private readonly loadingSessions = new WeakSet<Session>()
+  private readonly briefings: ResearchBriefings
 
-  constructor(ctx: Context) {
+  static Config = researcherConfigSchema
+
+  constructor(ctx: Context, config?: unknown) {
     super(ctx, 'researcher')
+    const resolved = resolveResearcherConfig(config)
+    this.viewConfig = { enabled: resolved.view.enabled, presetIds: [...resolved.view.presetIds] }
     this.store = new ResearchStore(ctx)
+    this.briefings = new ResearchBriefings(ctx)
     ctx.sessionProjections.register(researcherBindingProjectionDefinition)
+    if (resolved.view.enabled) ctx.plugin(ResearchViewService, resolved.view)
+  }
+
+  /** Return only browser-public view settings, including when the view service is disabled.
+   * No Session, Agent, workspace read, or authority mutation is needed.
+   */
+  async getViewConfig(signal?: AbortSignal): Promise<ResearchViewClientConfig> {
+    signal?.throwIfAborted()
+    return { enabled: this.viewConfig.enabled, presetIds: [...this.viewConfig.presetIds] }
+  }
+
+  /** Resolve the canonical read-only workspace for the view consumer. */
+  async viewWorkspace(context: ResearchReadContext): Promise<string> { return await this.store.canonicalWorkspace(context) }
+
+  /** Read verified graph records without agent lookup, activation, or authority mutation. */
+  async viewData(context: ResearchReadContext, id: ResearchId, config: ResearchViewConfig, signal?: AbortSignal): Promise<ResearchViewData> {
+    return await this.store.readViewData(context, id, config, signal)
+  }
+
+  private async publishMutation<T>(session: Session, id: ResearchId, operation: () => Promise<T>): Promise<T> {
+    const workspaceRoot = await this.store.canonicalWorkspace(session)
+    const result = await operation()
+    this.ctx.emit('researcher/changed', { workspaceRoot, researchId: id })
+    return result
   }
 
   binding(session: Session): ResearchBinding | undefined {
@@ -213,26 +285,111 @@ export class ResearcherService extends TypertRemoteService {
     signal?: AbortSignal,
   ): Promise<ResearchLoadResult> {
     const id = typeof idInput === 'string' ? parseResearchId(idInput) : idInput
+    this.assertLoadIdle(agent)
+    if (this.loadingSessions.has(agent.session)) {
+      throw new ResearcherError('a research load is already in progress in this session', 'RESEARCH_SESSION_BUSY')
+    }
+    this.loadingSessions.add(agent.session)
+    try {
+      return await this.activationGate(agent.session).run(async () => {
+        this.assertBindingCompatible(agent.session, id)
+        this.assertGoalCompatible(agent, id)
+        const workspaceRoot = await this.store.canonicalWorkspace(agent.session)
+        const target = await this.store.readTarget(agent.session, id, signal)
+        assertSessionEventAccess(agent.session)
+        const loadedAt = nowIso()
+        const binding = researchBindingSchema.parse({ version: 1, researchId: id, sessionId: String(agent.session.id), loadedAt })
+        const context = buildResearchContext(target, binding)
+        await this.store.bindSession(agent.session, id, loadedAt, signal)
+        signal?.throwIfAborted()
+        // No awaits between the final admission check, disarm, injection and briefing reservation.
+        this.assertLoadIdle(agent)
+        this.assertBindingCompatible(agent.session, id)
+        this.assertGoalCompatible(agent, id)
+        const current = this.ctx.goals.get(agent)
+        const goalAction = current?.activation === 'armed' && goalMarkerMatches(current, id) ? 'disarmed' : 'unchanged'
+        if (goalAction === 'disarmed') this.ctx.goals.disarm(agent)
+        const eventSeq = this.injectContext(agent, target, context, workspaceRoot)
+        try {
+          this.briefings.queue(agent)
+        } catch (error) {
+          throw new ResearcherError('research background was loaded, but its one-time briefing could not start; automatic work remains off', 'RESEARCH_BRIEFING_FAILED', { cause: error })
+        }
+        return { researchId: id, eventSeq, target, context, mode: target.recovery === undefined ? 'context-only' : 'recovery-only', goalAction, briefing: 'queued' }
+      })
+    } finally {
+      this.loadingSessions.delete(agent.session)
+    }
+  }
+
+  /** Start only the already-bound target after explicit human authorization at the command/tool boundary. */
+  async start(agent: Agent, signal?: AbortSignal): Promise<ResearchStartResult> {
     return await this.activationGate(agent.session).run(async () => {
-      this.assertBindingCompatible(agent.session, id)
-      const target = await this.store.readTarget(agent.session, id, signal)
-      return await this.activate(agent, target, signal)
+      if (this.briefings.busy(agent)) {
+        throw new ResearcherError('wait for the context briefing to finish before starting automatic research', 'RESEARCH_SESSION_BUSY')
+      }
+      const binding = this.requireBinding(agent.session)
+      const target = await this.store.readTarget(agent.session, binding.researchId, signal)
+      signal?.throwIfAborted()
+      this.assertGoalCompatible(agent, target.id)
+      if (target.recovery !== undefined) {
+        throw new ResearcherError('finish the unfinished run recovery before /research-start; loading never completes a run', 'RESEARCH_RUN_OPEN')
+      }
+      if (target.state.status === 'complete') {
+        throw new ResearcherError('completed research targets cannot be automatically restarted', 'RESEARCH_TARGET_COMPLETE')
+      }
+      this.assertGoalActivationCapacity(agent, target)
+      const current = this.ctx.goals.get(agent)
+      if (target.state.status === 'active' && current?.phase === 'active' && current.activation === 'armed' && goalMarkerMatches(current, target.id)) {
+        return { researchId: target.id, target, goalAction: 'unchanged' }
+      }
+      const activated = await this.activate(agent, target, signal)
+      return { researchId: activated.researchId, target: activated.target, goalAction: activated.goalAction }
     })
+  }
+
+  private assertLoadIdle(agent: Agent): void {
+    if (agent.status !== 'idle' || agent.inbox.nextStep.length > 0 || agent.inbox.nextTurn.length > 0 || this.briefings.busy(agent)) {
+      throw new ResearcherError('research loading requires an idle session with no pending input; stop the current work first', 'RESEARCH_SESSION_BUSY')
+    }
+  }
+
+  async createPlan(agent: Agent, request: CreateResearchPlanRequest, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    const id = this.requireBinding(agent.session).researchId
+    return await this.publishMutation(agent.session, id, () => this.store.createPlan(agent.session, id, request, signal))
+  }
+
+  async updatePlan(agent: Agent, request: UpdateResearchPlanRequest, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    const id = this.requireBinding(agent.session).researchId
+    return await this.publishMutation(agent.session, id, () => this.store.updatePlan(agent.session, id, request, signal))
+  }
+
+  async getPlan(agent: Agent, request: GetResearchPlanRequest, signal?: AbortSignal): Promise<ResearchPlanReadResult> {
+    return await this.store.getPlan(agent.session, this.requireBinding(agent.session).researchId, request, signal)
+  }
+
+  async listPlans(agent: Agent, request: ListResearchPlansRequest, signal?: AbortSignal): Promise<ResearchPlanListResult> {
+    return await this.store.listPlans(agent.session, this.requireBinding(agent.session).researchId, request, signal)
+  }
+
+  async selectPlan(agent: Agent, request: SelectResearchPlanRequest, signal?: AbortSignal): Promise<ResearchStateResult> {
+    const id = this.requireBinding(agent.session).researchId
+    return await this.publishMutation(agent.session, id, () => this.store.selectPlan(agent.session, id, request, signal))
   }
 
   async updateState(agent: Agent, request: UpdateResearchRequest, signal?: AbortSignal): Promise<ResearchStateResult> {
     const binding = this.requireBinding(agent.session)
-    return await this.store.appendState(agent.session, binding.researchId, request, signal)
+    return await this.publishMutation(agent.session, binding.researchId, () => this.store.appendState(agent.session, binding.researchId, request, signal))
   }
 
   async startRun(agent: Agent, request: StartResearchRunRequest, signal?: AbortSignal): Promise<ResearchRunStartResult> {
     const binding = this.requireBinding(agent.session)
-    return await this.store.startRun(agent.session, binding.researchId, request, signal)
+    return await this.publishMutation(agent.session, binding.researchId, () => this.store.startRun(agent.session, binding.researchId, request, signal))
   }
 
   async finishRun(agent: Agent, request: FinishResearchRunRequest, signal?: AbortSignal): Promise<ResearchRunFinishResult> {
     const binding = this.requireBinding(agent.session)
-    return await this.store.finishRun(agent.session, binding.researchId, request, signal)
+    return await this.publishMutation(agent.session, binding.researchId, () => this.store.finishRun(agent.session, binding.researchId, request, signal))
   }
 
   async updateGlossary(
@@ -248,7 +405,9 @@ export class ResearcherService extends TypertRemoteService {
     agent: Agent,
     initialTarget: ResearchTargetSnapshot,
     signal?: AbortSignal,
-  ): Promise<ResearchLoadResult> {
+  ): Promise<ResearchActivationResult> {
+    assertSessionEventAccess(agent.session)
+    const workspaceRoot = await this.store.canonicalWorkspace(agent.session)
     this.assertBindingCompatible(agent.session, initialTarget.id)
     this.assertGoalCompatible(agent, initialTarget.id)
     if (initialTarget.recovery === undefined) this.assertGoalActivationCapacity(agent, initialTarget)
@@ -256,6 +415,7 @@ export class ResearcherService extends TypertRemoteService {
       && (initialTarget.state.status === 'paused' || initialTarget.state.status === 'blocked')
       ? await this.store.resumeState(agent.session, initialTarget.id, signal)
       : initialTarget
+    if (target !== initialTarget) this.ctx.emit('researcher/changed', { workspaceRoot, researchId: target.id })
     const loadedAt = nowIso()
     const binding = researchBindingSchema.parse({
       version: 1,
@@ -264,27 +424,33 @@ export class ResearcherService extends TypertRemoteService {
       loadedAt,
     })
     const context = buildResearchContext(target, binding)
-    const message = createResearchContextMessage(context)
     await this.store.bindSession(agent.session, target.id, loadedAt, signal)
-    const eventSeq = agent.session.events.length
-    agent.inject(message)
-    const event = agent.session.events[eventSeq]
-    if (event?.type !== 'agent/inbox/spliced'
-      || !event.data.inserted.some(inserted => researchBindingFromMessage(inserted)?.researchId === target.id)) {
-      throw new ResearcherError('researcher context injection did not produce the expected durable inbox event', 'RESEARCH_INVALID_RECORD')
-    }
-    let goalAction: ResearchLoadResult['goalAction']
+    signal?.throwIfAborted()
+    const eventSeq = this.injectContext(agent, target, context, workspaceRoot)
+    let goalAction: ResearchActivationResult['goalAction']
     try {
       // Recovery binds a session but never edits frozen state or changes an existing Goal.
       goalAction = target.recovery === undefined ? this.applyGoalActivation(agent, target) : 'recovery-only'
     } catch (error) {
       throw new ResearcherError(
-        `research target ${target.id} was loaded and injected, but its DSH Goal could not be activated; retry /research-load ${target.id}`,
+        `research target ${target.id} was loaded and injected, but its DSH Goal could not be activated; use /research-start to retry explicitly`,
         'RESEARCH_GOAL_CONFLICT',
         { cause: error },
       )
     }
-    return { researchId: target.id, eventSeq: event.seq, target, context, goalAction }
+    return { researchId: target.id, eventSeq, target, context, goalAction }
+  }
+
+  private injectContext(agent: Agent, target: ResearchTargetSnapshot, context: ResearchLoadResult['context'], workspaceRoot: string): number {
+    const eventSeq = sessionNextSeq(agent.session)
+    agent.inject(createResearchContextMessage(context))
+    const event = sessionEventAt(agent.session, eventSeq)
+    if (event?.type !== 'agent/inbox/spliced'
+      || !event.data.inserted.some(inserted => researchBindingFromMessage(inserted)?.researchId === target.id)) {
+      throw new ResearcherError('researcher context injection did not produce the expected durable inbox event', 'RESEARCH_INVALID_RECORD')
+    }
+    this.ctx.emit('researcher/changed', { workspaceRoot, researchId: target.id })
+    return event.seq
   }
 
   private assertCreateCompatible(agent: Agent): void {
@@ -323,8 +489,7 @@ export class ResearcherService extends TypertRemoteService {
     if (target.state.status === 'complete') return
     const goal = this.ctx.goals.get(agent)
     if (goal === undefined || goal.phase === 'complete') return
-    const needsResume = goal.phase !== 'active' || goal.activation !== 'armed'
-    if (needsResume && goal.roundsStarted >= goal.maxGoalRounds) {
+    if (goal.roundsStarted >= goal.maxGoalRounds) {
       throw new ResearcherError(
         `DSH Goal ${goal.id} exhausted its ${goal.maxGoalRounds} automatic rounds before researcher activation`,
         'RESEARCH_GOAL_CONFLICT',
@@ -340,7 +505,7 @@ export class ResearcherService extends TypertRemoteService {
     return created
   }
 
-  private applyGoalActivation(agent: Agent, target: ResearchTargetSnapshot): ResearchLoadResult['goalAction'] {
+  private applyGoalActivation(agent: Agent, target: ResearchTargetSnapshot): ResearchActivationResult['goalAction'] {
     const current = this.ctx.goals.get(agent)
     if (target.state.status === 'complete') {
       if (current !== undefined && current.phase !== 'complete' && goalMarkerMatches(current, target.id)) {
@@ -383,16 +548,28 @@ export const name = 'researcher'
 export const inject = ResearcherService.inject
 export default ResearcherService
 
+export type { PlanVersionRef, PlanContentInput, PlanMetadata, PlanDocument, PlanLedgerEntry } from './plan-schema.ts'
+
 export type {
   ResearchRecovery,
   CreateResearchRequest,
+  CreateResearchPlanRequest,
+  UpdateResearchPlanRequest,
+  GetResearchPlanRequest,
+  ListResearchPlansRequest,
+  SelectResearchPlanRequest,
+  ResearchPlanReadResult,
+  ResearchPlanListResult,
   FinishResearchRunRequest,
   ResearchBinding,
   ResearchCreateResult,
   ResearchGlossaryPatch,
   ResearchGlossaryResult,
   ResearchId,
+  ResearchViewClientConfig,
   ResearchLoadResult,
+  ResearchActivationResult,
+  ResearchStartResult,
   ResearchReadResult,
   ResearchRunFinishResult,
   ResearchRunStartResult,

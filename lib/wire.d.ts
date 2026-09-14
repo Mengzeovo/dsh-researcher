@@ -1,6 +1,8 @@
-/** Browser-safe strict schemas for the single researcher Remote surface. */
+/** Browser-safe strict schemas for the Root researcher Remote methods. */
 import { z } from 'zod';
-import type { InvalidResearchTargetSummary, ResearchId, ResearchTargetList, ResearchTargetListRequest, ResearchTargetSummary } from './types.ts';
+import type { InvalidResearchTargetSummary, ResearchId, ResearchViewClientConfig, ResearchTargetList, ResearchTargetListRequest, ResearchTargetSummary } from './types.ts';
+/** Reject extra fields rather than forwarding arbitrary Host configuration. */
+export declare const researchViewClientConfigSchema: z.ZodType<ResearchViewClientConfig>;
 export declare const UUID_PATTERN: RegExp;
 export declare const researchIdSchema: z.ZodPipe<z.ZodString, z.ZodTransform<ResearchId, string>>;
 export declare const researchStatusSchema: z.ZodEnum<{

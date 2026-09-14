@@ -1,0 +1,34 @@
+# Built-artifact acceptance profile; paths are materialized into a private test root.
+- name: "@DSH@/packages/core/agent/lib/index.js"
+- name: "@DSH@/packages/core/session/lib/index.js"
+- name: "@DSH@/packages/session/session-projection/lib/index.js"
+- name: "@DSH@/packages/core/system-prompt/lib/index.js"
+- name: "@DSH@/packages/core/tools/lib/index.js"
+- name: "@DSH@/packages/goal/goal/lib/index.js"
+- name: "@DSH@/packages/fs/fs-local/lib/index.js"
+  config:
+    cwd: "@WORKSPACE@"
+- name: "@DSH@/packages/subprocess/subprocess-local/lib/index.js"
+- name: "@DSH@/packages/sandbox/sandbox-local/lib/index.js"
+- id: sandbox-policy
+  name: "@DSH@/packages/sandbox/sandbox-policy/lib/index.js"
+  config:
+    mode: read-only
+    workspaceRoot: "@WORKSPACE@"
+- name: "@DSH@/packages/session/session-persistence-jsonl/lib/index.js"
+  config:
+    root: "@SESSIONS@"
+    compression: none
+- name: "@DSH@/packages/session-query/session-query-sqlite/lib/index.js"
+  config:
+    path: ':memory:'
+    openAt: never
+- id: fixture-app
+  name: "@FIXTURE@/app.mjs"
+- id: archify
+  name: "@NATIVE@"
+- id: researcher
+  name: "@RESEARCHER@/lib/index.js"
+  config:
+    view:
+      enabled: true

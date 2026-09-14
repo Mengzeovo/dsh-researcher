@@ -2,6 +2,8 @@ import { Buffer } from 'node:buffer'
 import path from 'node:path'
 import { z } from 'zod'
 import type {
+  PreparedPlanRunResult,
+  PreparedResearchRunResult,
   ResearchBinding,
   ResearchGlossary,
   ResearchGoalDocument,
@@ -12,6 +14,8 @@ import type {
   ResearchState,
   RunId,
 } from './types.ts'
+import { isCheckpointRunResult, samePlanVersionRef } from './types.ts'
+import { planVersionRefSchema } from './plan-schema.ts'
 import { ResearcherError, invalidRecord } from './errors.ts'
 import { UUID_PATTERN, researchIdSchema, researchStatusSchema } from './wire.ts'
 export {
@@ -39,8 +43,7 @@ const jsonRecord = z.record(z.string(), z.json())
 
 export const runIdSchema = z.string().regex(UUID_PATTERN).transform(value => value as RunId)
 
-export const researchStateSchema: z.ZodType<ResearchState> = z.object({
-  version: z.literal(1),
+const stateFields = {
   revision: positiveRevision,
   at: isoUtc,
   sessionId: nonBlank,
@@ -49,7 +52,15 @@ export const researchStateSchema: z.ZodType<ResearchState> = z.object({
   direction: nonBlank.optional(),
   next: nonBlank.optional(),
   lastRunId: runIdSchema.optional(),
+}
+export const researchStateV1Schema = z.object({ version: z.literal(1), ...stateFields }).strict()
+export const researchStateV2Schema = z.object({
+  version: z.literal(2), ...stateFields, selectedPlanRef: planVersionRefSchema.optional(),
 }).strict()
+/** Reading legacy snapshots never manufactures a selection or changes their version. */
+export const researchStateSchema: z.ZodType<ResearchState> = z.discriminatedUnion('version', [
+  researchStateV1Schema, researchStateV2Schema,
+])
 
 const glossaryMapSchema = z.record(nonBlank, nonBlank)
 export const researchGlossarySchema: z.ZodType<ResearchGlossary> = z.object({
@@ -134,6 +145,7 @@ const descriptionFields = {
 export const researchRunDescriptionSchema: z.ZodType<ResearchRunDescription> = z.discriminatedUnion('version', [
   z.object({ version: z.literal(1), ...descriptionFields }).strict(),
   z.object({ version: z.literal(2), ...descriptionFields, baseStateRevision: positiveRevision, checkpoint: inputCheckpointSchema }).strict(),
+  z.object({ version: z.literal(3), ...descriptionFields, baseStateRevision: positiveRevision, checkpoint: inputCheckpointSchema, planRef: planVersionRefSchema }).strict(),
 ])
 
 const resultFields = {
@@ -146,19 +158,49 @@ const resultFields = {
   artifacts: z.array(nonBlank),
   transition: researchStateSchema,
 }
-export const researchRunResultSchema: z.ZodType<ResearchRunResult> = z.discriminatedUnion('version', [
-  z.object({ version: z.literal(1), ...resultFields }).strict(),
-  z.object({ version: z.literal(2), ...resultFields, checkpoint: outputCheckpointSchema }).strict(),
-]).superRefine((value, ctx) => {
+const legacyResultObject = z.object({ version: z.literal(1), ...resultFields }).strict()
+const planResultFields = {
+  ...resultFields,
+  version: z.literal(3),
+  artifacts: uniquePaths,
+  planRef: planVersionRefSchema,
+  transition: researchStateV2Schema.extend({ selectedPlanRef: planVersionRefSchema }),
+}
+const preparedPlanResultObject = z.object(planResultFields).strict()
+
+function validateResultArtifacts(value: { readonly artifacts: readonly string[] }, ctx: z.RefinementCtx): void {
   value.artifacts.forEach((artifact, index) => {
     try { normalizeProjectRelativePath(artifact) } catch (error) {
       ctx.addIssue({ code: 'custom', path: ['artifacts', index], message: error instanceof Error ? error.message : String(error) })
     }
   })
-  if (value.version === 2 && (new Set(value.artifacts).size !== value.artifacts.length
+}
+function validatePlanSelection(value: Pick<PreparedPlanRunResult, 'planRef' | 'transition'>, ctx: z.RefinementCtx): void {
+  if (!samePlanVersionRef(value.planRef, value.transition.selectedPlanRef)) {
+    ctx.addIssue({ code: 'custom', path: ['transition', 'selectedPlanRef'], message: 'prepared state selection must match the exact run plan reference' })
+  }
+}
+
+/** A journal payload has no checkpoint: its output commit does not exist yet. */
+export const preparedPlanRunResultSchema: z.ZodType<PreparedPlanRunResult> = preparedPlanResultObject.superRefine(validatePlanSelection)
+export const researchPreparedRunResultSchema: z.ZodType<PreparedResearchRunResult> = z.discriminatedUnion('version', [
+  legacyResultObject, preparedPlanResultObject,
+]).superRefine((value, ctx) => {
+  validateResultArtifacts(value, ctx)
+  if (value.version === 3) validatePlanSelection(value, ctx)
+})
+
+export const researchRunResultSchema: z.ZodType<ResearchRunResult> = z.discriminatedUnion('version', [
+  legacyResultObject,
+  z.object({ version: z.literal(2), ...resultFields, checkpoint: outputCheckpointSchema }).strict(),
+  z.object({ ...planResultFields, checkpoint: outputCheckpointSchema }).strict(),
+]).superRefine((value, ctx) => {
+  validateResultArtifacts(value, ctx)
+  if (isCheckpointRunResult(value) && (new Set(value.artifacts).size !== value.artifacts.length
     || JSON.stringify(value.artifacts) !== JSON.stringify(value.checkpoint.artifacts.map(item => item.path)))) {
     ctx.addIssue({ code: 'custom', path: ['checkpoint', 'artifacts'], message: 'checkpoint digests must match the exact artifact list' })
   }
+  if (value.version === 3) validatePlanSelection(value, ctx)
 })
 
 export const researchSessionIndexSchema: z.ZodType<ResearchSessionIndex> = z.object({

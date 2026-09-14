@@ -1,5 +1,9 @@
 import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
+import type { ResearchReadContext } from './view-types.ts'
+
+/** Read operations accept an observed workspace without materializing a Session. */
+type ReadContext = Session | ResearchReadContext
 import { FsError, type FsTarget, type FsVersion } from '@deepseek-ai/dsh-fs'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
@@ -7,8 +11,10 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { commitResearchDirectory, discardResearchStaging, ensureResearchDirectories } from './directories.ts'
 import { ResearcherError, invalidRecord } from './errors.ts'
 import { parseRunLog, parseStateLog, type ParsedStateLog } from './jsonl.ts'
+import { parsePlanDocument, parsePlanLedger, planDirectory, planLedgerPath, planRoot, planVersionPath, type ParsedPlanLedger } from './plan-records.ts'
+import type { PlanDocument } from './plan-schema.ts'
 import { RECORD_MAX_BYTES, SESSION_INDEX_MAX_BYTES, encodeSessionId, parseGoalMarkdown, parseJsonText, researchGlossarySchema, researchSessionIndexSchema } from './schema.ts'
-import type { ResearchGlossary, ResearchId, ResearchRun, ResearchSessionIndex, RunId } from './types.ts'
+import { isCheckpointRunDescription, type ResearchGlossary, type ResearchId, type ResearchRun, type ResearchSessionIndex, type RunId } from './types.ts'
 
 export interface VersionedText {
   readonly relativePath: string
@@ -22,13 +28,13 @@ export interface ObservedRecord<T> extends VersionedText {
   readonly value: T
 }
 
-function sessionCwd(session: Session): string {
-  const cwd = session.header.cwd
+function sessionCwd(session: ReadContext): string {
+  const cwd = 'workspaceRoot' in session ? session.workspaceRoot : session.header.cwd
   if (cwd === undefined) throw new ResearcherError('researcher requires a session workspace cwd', 'RESEARCH_PATH_INVALID')
   return cwd
 }
 
-function pathOptions(session: Session, signal?: AbortSignal): { cwd: string; signal?: AbortSignal } {
+function pathOptions(session: ReadContext, signal?: AbortSignal): { cwd: string; signal?: AbortSignal } {
   const cwd = sessionCwd(session)
   return signal === undefined ? { cwd } : { cwd, signal }
 }
@@ -67,11 +73,11 @@ function mapWriteError(error: unknown, subject: string): never {
 export class RecordStore {
   constructor(private readonly ctx: Context) {}
 
-  async canonicalWorkspace(session: Session): Promise<string> {
+  async canonicalWorkspace(session: ReadContext): Promise<string> {
     return await realpath(sessionCwd(session))
   }
 
-  private async workspaceTarget(session: Session, signal?: AbortSignal): Promise<FsTarget> {
+  private async workspaceTarget(session: ReadContext, signal?: AbortSignal): Promise<FsTarget> {
     const target = await this.ctx.fs.resolve('.', pathOptions(session, signal))
     const info = await this.ctx.fs.stat(target, signal)
     if (info?.type !== 'directory') {
@@ -80,7 +86,7 @@ export class RecordStore {
     return target
   }
 
-  private async resolveContained(session: Session, relative: string, signal?: AbortSignal): Promise<FsTarget> {
+  private async resolveContained(session: ReadContext, relative: string, signal?: AbortSignal): Promise<FsTarget> {
     const root = await this.workspaceTarget(session, signal)
     const target = await this.ctx.fs.resolve(relative, pathOptions(session, signal))
     if (!this.ctx.fs.contains(root, target)) {
@@ -89,7 +95,7 @@ export class RecordStore {
     return target
   }
 
-  async assertRealDirectory(session: Session, relative: string, signal?: AbortSignal): Promise<void> {
+  async assertRealDirectory(session: ReadContext, relative: string, signal?: AbortSignal): Promise<void> {
     const info = await this.ctx.fs.lstat(relative, { cwd: sessionCwd(session) }, signal)
     if (info === undefined) throw new ResearcherError(`missing research directory: ${relative}`, 'RESEARCH_NOT_FOUND')
     if (info.type !== 'directory') {
@@ -97,7 +103,7 @@ export class RecordStore {
     }
   }
 
-  private async assertRealFile(session: Session, relative: string, signal?: AbortSignal): Promise<void> {
+  private async assertRealFile(session: ReadContext, relative: string, signal?: AbortSignal): Promise<void> {
     const info = await this.ctx.fs.lstat(relative, { cwd: sessionCwd(session) }, signal)
     if (info === undefined) throw new ResearcherError(`research file not found: ${relative}`, 'RESEARCH_NOT_FOUND')
     if (info.type !== 'file') {
@@ -106,7 +112,7 @@ export class RecordStore {
   }
 
   private async resolveAuthorityContained(
-    session: Session,
+    session: ReadContext,
     id: ResearchId,
     relative: string,
     signal?: AbortSignal,
@@ -120,7 +126,7 @@ export class RecordStore {
   }
 
   private async readVersioned(
-    session: Session,
+    session: ReadContext,
     id: ResearchId,
     relative: string,
     maxBytes: number | undefined,
@@ -193,25 +199,25 @@ export class RecordStore {
     }
   }
 
-  async readGoal(session: Session, id: ResearchId, signal?: AbortSignal): Promise<ObservedRecord<ReturnType<typeof parseGoalMarkdown>>> {
+  async readGoal(session: ReadContext, id: ResearchId, signal?: AbortSignal): Promise<ObservedRecord<ReturnType<typeof parseGoalMarkdown>>> {
     const file = await this.readVersioned(session, id, `${targetRoot(id)}/goal.md`, RECORD_MAX_BYTES, signal)
     return { ...file, value: parseGoalMarkdown(file.text) }
   }
 
-  async readStateLog(session: Session, id: ResearchId, signal?: AbortSignal): Promise<ObservedRecord<ParsedStateLog>> {
-    const file = await this.readVersioned(session, id, statePath(id), undefined, signal)
+  async readStateLog(session: ReadContext, id: ResearchId, signal?: AbortSignal, maxBytes?: number): Promise<ObservedRecord<ParsedStateLog>> {
+    const file = await this.readVersioned(session, id, statePath(id), maxBytes, signal)
     return { ...file, value: parseStateLog(file.text) }
   }
 
-  async readGlossary(session: Session, id: ResearchId, signal?: AbortSignal): Promise<ObservedRecord<ResearchGlossary>> {
+  async readGlossary(session: ReadContext, id: ResearchId, signal?: AbortSignal): Promise<ObservedRecord<ResearchGlossary>> {
     const file = await this.readVersioned(session, id, glossaryPath(id), RECORD_MAX_BYTES, signal)
     return { ...file, value: parseJsonText(file.relativePath, file.text, researchGlossarySchema, RECORD_MAX_BYTES) }
   }
 
-  async readRun(session: Session, id: ResearchId, runId: RunId, signal?: AbortSignal): Promise<ObservedRecord<ResearchRun>> {
+  async readRun(session: ReadContext, id: ResearchId, runId: RunId, signal?: AbortSignal): Promise<ObservedRecord<ResearchRun>> {
     const file = await this.readVersioned(session, id, runPath(id, runId), undefined, signal)
     const run = parseRunLog(runId, file.text)
-    if (run.description.version === 2) {
+    if (isCheckpointRunDescription(run.description)) {
       const expected = 'refs/dsh/research/' + id + '/runs/' + run.id
       if (run.description.checkpoint.inputRef !== expected + '/input'
         || run.description.checkpoint.outputRef !== expected + '/output') {
@@ -242,7 +248,7 @@ export class RecordStore {
     return { relativePath: relative, target, version: info.version, text, value }
   }
 
-  async listTargetEntries(session: Session, signal?: AbortSignal) {
+  async listTargetEntries(session: ReadContext, signal?: AbortSignal) {
     const root = await this.resolveContained(session, '.research/goal', signal)
     const info = await this.ctx.fs.stat(root, signal)
     if (info === undefined) return []
@@ -254,13 +260,98 @@ export class RecordStore {
     return await this.ctx.fs.listDir(root, signal)
   }
 
-  async listRunEntries(session: Session, id: ResearchId, signal?: AbortSignal, verifyDirectory = false) {
+  async listRunEntries(session: ReadContext, id: ResearchId, signal?: AbortSignal, verifyDirectory = false) {
     const directory = await this.resolveAuthorityContained(session, id, `${targetRoot(id)}/runs`, signal)
     if (verifyDirectory) {
       const info = await this.ctx.fs.stat(directory, signal)
       if (info?.type !== 'directory') invalidRecord(`${targetRoot(id)}/runs is not a directory`)
     }
     return await this.ctx.fs.listDir(directory, signal)
+  }
+
+  private async assertPlanDirectories(session: ReadContext, id: ResearchId, planId: number | undefined, signal?: AbortSignal): Promise<void> {
+    await this.assertRealDirectory(session, '.research', signal)
+    await this.assertRealDirectory(session, '.research/goal', signal)
+    await this.assertRealDirectory(session, targetRoot(id), signal)
+    await this.assertRealDirectory(session, planRoot(id), signal)
+    if (planId !== undefined) await this.assertRealDirectory(session, planDirectory(id, planId), signal)
+  }
+
+  /** Older targets legitimately have no plan directory until their first publication. */
+  async listPlanEntries(session: ReadContext, id: ResearchId, signal?: AbortSignal) {
+    await this.assertRealDirectory(session, '.research', signal)
+    await this.assertRealDirectory(session, '.research/goal', signal)
+    await this.assertRealDirectory(session, targetRoot(id), signal)
+    const relative = planRoot(id)
+    const linkInfo = await this.ctx.fs.lstat(relative, { cwd: sessionCwd(session) }, signal)
+    if (linkInfo === undefined) return []
+    await this.assertRealDirectory(session, relative, signal)
+    const directory = await this.resolveAuthorityContained(session, id, relative, signal)
+    return await this.ctx.fs.listDir(directory, signal)
+  }
+
+  async listPlanFiles(session: ReadContext, id: ResearchId, planId: number, signal?: AbortSignal) {
+    await this.assertPlanDirectories(session, id, planId, signal)
+    const directory = await this.resolveAuthorityContained(session, id, planDirectory(id, planId), signal)
+    return await this.ctx.fs.listDir(directory, signal)
+  }
+
+  async readPlanLedger(session: ReadContext, id: ResearchId, planId: number, signal?: AbortSignal, maxBytes?: number): Promise<ObservedRecord<ParsedPlanLedger>> {
+    await this.assertPlanDirectories(session, id, planId, signal)
+    const file = await this.readVersioned(session, id, planLedgerPath(id, planId), maxBytes, signal)
+    return { ...file, value: parsePlanLedger(planId, file.text) }
+  }
+
+  async readPlanDocument(
+    session: ReadContext,
+    id: ResearchId,
+    planId: number,
+    revision: number,
+    signal?: AbortSignal,
+  ): Promise<ObservedRecord<PlanDocument>> {
+    await this.assertPlanDirectories(session, id, planId, signal)
+    const relative = planVersionPath(id, planId, revision)
+    await this.assertRealFile(session, relative, signal)
+    const target = await this.resolveAuthorityContained(session, id, relative, signal)
+    const info = await this.ctx.fs.stat(target, signal)
+    if (info === undefined) throw new ResearcherError(`research file not found: ${relative}`, 'RESEARCH_NOT_FOUND')
+    if (info.type !== 'file') invalidRecord(`${relative} is not a regular file`)
+    if (info.size !== undefined && info.size > RECORD_MAX_BYTES) {
+      throw new ResearcherError(`${relative} exceeds ${RECORD_MAX_BYTES} bytes`, 'RESEARCH_OVERSIZED')
+    }
+    let bytes: Uint8Array
+    try {
+      bytes = await this.ctx.fs.readBytes(target, signal, RECORD_MAX_BYTES)
+    } catch (error) {
+      if (error instanceof FsError && error.code === 'FS_TOO_LARGE') {
+        throw new ResearcherError(`${relative} exceeds ${RECORD_MAX_BYTES} bytes`, 'RESEARCH_OVERSIZED', { cause: error })
+      }
+      throw error
+    }
+    let text: string
+    try {
+      // A fatal decode is reversible: hashing this string hashes the exact original bytes.
+      // Preserve BOMs rather than silently stripping bytes from the digest.
+      text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
+    } catch (error) {
+      invalidRecord(`${relative} is not valid UTF-8`, { cause: error })
+    }
+    return { relativePath: relative, target, version: info.version, text, value: parsePlanDocument(text, { planId, revision }) }
+  }
+
+  /** An unregistered next-version file may be read, but this method never registers it. */
+  async findPlanDocument(
+    session: Session,
+    id: ResearchId,
+    planId: number,
+    revision: number,
+    signal?: AbortSignal,
+  ): Promise<ObservedRecord<PlanDocument> | undefined> {
+    await this.assertPlanDirectories(session, id, planId, signal)
+    const relative = planVersionPath(id, planId, revision)
+    const info = await this.ctx.fs.lstat(relative, { cwd: sessionCwd(session) }, signal)
+    if (info === undefined) return undefined
+    return await this.readPlanDocument(session, id, planId, revision, signal)
   }
 
   /** Project references intentionally do not inherit authority-record symlink/type restrictions. */

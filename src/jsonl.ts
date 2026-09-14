@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { ResearchRun, ResearchRunDescription, ResearchRunResult, ResearchState, RunId } from './types.ts'
+import { isCheckpointRunDescription, isCheckpointRunResult, samePlanVersionRef } from './types.ts'
 import {
   RECORD_MAX_BYTES,
   assertUtf8Bound,
@@ -101,7 +102,7 @@ export function parseRunLog(runId: RunId, text: string): ResearchRun {
   }
   const description = researchRunDescriptionSchema.safeParse(parsed.lines[0]?.value)
   if (!description.success) invalidRecord(`runs/${runId}.jsonl description is invalid: ${z.prettifyError(description.error)}`)
-  if (description.data.version === 2) {
+  if (isCheckpointRunDescription(description.data)) {
     const cp = description.data.checkpoint
     if (!cp.inputRef.endsWith('/runs/' + runId + '/input')
       || cp.outputRef !== cp.inputRef.slice(0, -'input'.length) + 'output') {
@@ -117,7 +118,7 @@ export function parseRunLog(runId: RunId, text: string): ResearchRun {
   const desc = description.data
   const closed = result.data
   if (desc.version !== closed.version) invalidRecord(`runs/${runId}.jsonl record versions disagree`)
-  if (desc.version === 2 && closed.version === 2) {
+  if (isCheckpointRunDescription(desc) && isCheckpointRunResult(closed)) {
     const before = desc.checkpoint
     const after = closed.checkpoint
     const width = after.objectFormat === 'sha1' ? 40 : 64
@@ -130,6 +131,9 @@ export function parseRunLog(runId: RunId, text: string): ResearchRun {
       || after.codeChanged !== (after.inputTree !== after.outputTree)) {
       invalidRecord(`runs/${runId}.jsonl checkpoint identity or transition disagrees with its description`)
     }
+  }
+  if (desc.version === 3 && closed.version === 3 && !samePlanVersionRef(desc.planRef, closed.planRef)) {
+    invalidRecord(`runs/${runId}.jsonl result plan reference disagrees with its description`)
   }
   return { id: runId, description: desc, result: closed }
 }

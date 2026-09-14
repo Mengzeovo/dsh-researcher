@@ -7,6 +7,7 @@ import type {} from '@deepseek-ai/dsh-session-projection'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { markerResearchId } from './context.ts'
 import { ResearcherError } from './errors.ts'
+import { sessionEvents } from './session-events.ts'
 import type { ResearchId } from './types.ts'
 
 export interface ResearchToolExecution {
@@ -20,7 +21,7 @@ function reject(message: string, code: 'RESEARCH_AUTHORITY_REQUIRED' | 'RESEARCH
 }
 
 function openTurnEvents(ctx: Context, agent: Agent): Pick<ResearchToolExecution, 'events' | 'openTurnStartSeq'> {
-  const events = agent.session.events
+  const events = sessionEvents(agent.session)
   const boundary = ctx.sessionProjections.stateOf(agent.session, 'turnBoundary')
   if (boundary === undefined || boundary.openTurnStartSeq === null) {
     reject('researcher tools require an open model turn', 'RESEARCH_DRIVER_REQUIRED')

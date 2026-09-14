@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ResearchBinding, ResearchGlossary, ResearchGoalDocument, ResearchId, ResearchRunDescription, ResearchRunResult, ResearchSessionIndex, ResearchState, RunId } from './types.ts';
+import type { PreparedPlanRunResult, PreparedResearchRunResult, ResearchBinding, ResearchGlossary, ResearchGoalDocument, ResearchId, ResearchRunDescription, ResearchRunResult, ResearchSessionIndex, ResearchState, RunId } from './types.ts';
 export { invalidResearchTargetSummarySchema, researchIdSchema, researchStatusSchema, researchTargetListRequestSchema, researchTargetListSchema, researchTargetSummarySchema, } from './wire.ts';
 export declare const RECORD_MAX_BYTES: number;
 export declare const SESSION_INDEX_MAX_BYTES: number;
@@ -7,6 +7,40 @@ export declare const CONTEXT_MAX_CHARS: number;
 export declare const POPUP_LABEL_MAX_CHARS = 120;
 export declare const SESSION_FILENAME_MAX_CHARS = 240;
 export declare const runIdSchema: z.ZodPipe<z.ZodString, z.ZodTransform<RunId, string>>;
+export declare const researchStateV1Schema: z.ZodObject<{
+    revision: z.ZodNumber;
+    at: z.ZodString;
+    sessionId: z.ZodString;
+    status: z.ZodEnum<{
+        active: "active";
+        paused: "paused";
+        blocked: "blocked";
+        complete: "complete";
+    }>;
+    summary: z.ZodString;
+    direction: z.ZodOptional<z.ZodString>;
+    next: z.ZodOptional<z.ZodString>;
+    lastRunId: z.ZodOptional<z.ZodPipe<z.ZodString, z.ZodTransform<RunId, string>>>;
+    version: z.ZodLiteral<1>;
+}, z.core.$strict>;
+export declare const researchStateV2Schema: z.ZodObject<{
+    selectedPlanRef: z.ZodOptional<z.ZodType<import("./plan-schema.ts").PlanVersionRef, unknown, z.core.$ZodTypeInternals<import("./plan-schema.ts").PlanVersionRef, unknown>>>;
+    revision: z.ZodNumber;
+    at: z.ZodString;
+    sessionId: z.ZodString;
+    status: z.ZodEnum<{
+        active: "active";
+        paused: "paused";
+        blocked: "blocked";
+        complete: "complete";
+    }>;
+    summary: z.ZodString;
+    direction: z.ZodOptional<z.ZodString>;
+    next: z.ZodOptional<z.ZodString>;
+    lastRunId: z.ZodOptional<z.ZodPipe<z.ZodString, z.ZodTransform<RunId, string>>>;
+    version: z.ZodLiteral<2>;
+}, z.core.$strict>;
+/** Reading legacy snapshots never manufactures a selection or changes their version. */
 export declare const researchStateSchema: z.ZodType<ResearchState>;
 export declare const researchGlossarySchema: z.ZodType<ResearchGlossary>;
 export declare const reproductionSchema: z.ZodObject<{
@@ -23,8 +57,8 @@ export declare const inputCheckpointSchema: z.ZodObject<{
     inputTree: z.ZodString;
     baseHead: z.ZodString;
     objectFormat: z.ZodEnum<{
-        sha1: "sha1";
         sha256: "sha256";
+        sha1: "sha1";
     }>;
     files: z.ZodArray<z.ZodString>;
     reproduction: z.ZodObject<{
@@ -43,8 +77,8 @@ export declare const outputCheckpointSchema: z.ZodObject<{
     inputTree: z.ZodString;
     outputTree: z.ZodString;
     objectFormat: z.ZodEnum<{
-        sha1: "sha1";
         sha256: "sha256";
+        sha1: "sha1";
     }>;
     codeChanged: z.ZodBoolean;
     artifacts: z.ZodArray<z.ZodObject<{
@@ -54,6 +88,9 @@ export declare const outputCheckpointSchema: z.ZodObject<{
     }, z.core.$strict>>;
 }, z.core.$strict>;
 export declare const researchRunDescriptionSchema: z.ZodType<ResearchRunDescription>;
+/** A journal payload has no checkpoint: its output commit does not exist yet. */
+export declare const preparedPlanRunResultSchema: z.ZodType<PreparedPlanRunResult>;
+export declare const researchPreparedRunResultSchema: z.ZodType<PreparedResearchRunResult>;
 export declare const researchRunResultSchema: z.ZodType<ResearchRunResult>;
 export declare const researchSessionIndexSchema: z.ZodType<ResearchSessionIndex>;
 export declare const researchBindingSchema: z.ZodType<ResearchBinding>;

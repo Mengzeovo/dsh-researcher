@@ -2,11 +2,11 @@
 
 ## Contract
 
-New runs use record version 2 and require a reproduction recipe. A run is an execution instance, not a chat turn. Prepare code before starting the run. Start captures the **working-file bytes**, including unstaged edits, rather than merely recording HEAD or committing the user's index. It does not launch the command. Finish captures the final state of the same file set, hashes declared artifacts, and publishes the immutable result and its state transition.
+New runs use record version 3 and require both an explicitly selected immutable plan revision and a reproduction recipe. A run is an execution instance, not a chat turn. Prepare code before starting the run. Start captures the **working-file bytes**, including unstaged edits, rather than merely recording HEAD or committing the user's index. It does not launch the command. Finish captures the final state of the same file set, hashes declared artifacts, and publishes the immutable result and its state transition.
 
 A checkpoint proves that particular bytes and metadata were saved. It does **not** prove that a process read those bytes, that all dependencies were declared, or that replay yields the same result. In particular, start/end equality does not detect a file changed and reverted during execution. Do not edit source while an execution is running. For stronger isolation, execute from a separate materialized input snapshot; this first version does not launch or sandbox the research execution for you.
 
-Existing version 1 runs remain readable and finishable without Git. They are explicitly labeled as lacking a code checkpoint; no historical snapshot is fabricated. All newly started runs require Git and the new recipe. Upgrade tool clients that call start_research_run.
+Existing version 1 runs remain readable and finishable without Git. They are explicitly labeled as lacking a code checkpoint; no historical snapshot is fabricated. Existing version 2 checkpoint runs also remain readable/finishable without fabricated plan provenance. All newly started runs require Git, the recipe, and `plan: {plan_id, revision}` matching the verified state selection (including baseline/probe executions). Upgrade tool clients that call start_research_run.
 
 ## Starting and finishing
 
@@ -14,6 +14,7 @@ Example additional start field:
 
 ```json
 {
+  "plan": {"plan_id": 1, "revision": 1},
   "reproduction": {
     "command": "python scripts/evaluate.py --seed 7 --output results/seed-7.json",
     "cwd": ".",
@@ -52,14 +53,16 @@ refs/dsh/research/<research-id>/runs/<run-id>/output
 
 The output commit has the input commit as its parent. Both object IDs are pinned in the run records. HEAD, the current branch, the real index, and working files remain unchanged. No commit, stash, checkout, reset or push is performed on the user's branch.
 
+Journal versions are independent of run versions: input envelope v1 is unchanged; legacy output envelope v1 contains prepared v1 and publishes run result v2; new output envelope v2 contains prepared v3 and publishes run result v3. Prepared v3 includes the exact plan reference and state-v2 selection, but no checkpoint. The journal checkpoint excludes outputCommit, derived afterward from the containing Git commit. Old request keys remain unchanged; v3 keys additionally bind the original plan reference. Historical prepared transitions are replayed verbatim, never upgraded or filled from the latest plan. See [plans.md](plans.md).
+
 The output commit message is a recovery journal: it carries the exact prepared result/state and a canonical hash of the caller's finish payload. Publishing follows this order:
 
-1. Validate caller result/state, freeze output and artifact digests, preflight the complete v2 record and load context.
+1. Validate caller result/state, freeze output and artifact digests, preflight the complete supported checkpoint record (v2/v3) and load context.
 2. Create and pin the output commit/ref with compare-and-swap.
 3. Publish the closed run record.
 4. Append its exact prepared state transition.
 
-A retry after step 2 reads the existing journal and reuses the original hashes, timestamps and files rather than recapturing the current workspace. A changed finish payload is rejected. A retry after step 3 uses the existing immutable run result. No new run may start while the previous run is open or its state transition is pending. Ordinary state updates are refused while a v2 run is open, keeping its base revision stable. This is recoverable multi-resource publication, not an atomic Git/filesystem transaction.
+A retry after step 2 reads the existing journal and reuses the original hashes, timestamps and files rather than recapturing the current workspace. A changed finish payload is rejected. A retry after step 3 uses the existing immutable run result. No new run may start while the previous run is open or its state transition is pending. Ordinary state updates are refused while a v2/v3 run is open, keeping its base revision stable. This is recoverable multi-resource publication, not an atomic Git/filesystem transaction.
 
 A start that pinned its input but failed to publish its run reports the retained ref. No experiment was launched; the orphan ref may be inspected/removed explicitly by the operator. Do not automatically delete refs on an ambiguous interruption.
 
@@ -69,16 +72,16 @@ The existing single-writer restriction still applies. Per-target locking does no
 
 Only active targets may start new runs. Paused/blocked starts are rejected before any input checkpoint or run record is created. Existing records from older versions that allowed these starts remain recoverable.
 
-Human `/research-load <research-id>` now detects open records and pending prepared transitions. It binds the session and returns `goal_action: recovery-only`, leaving the research revision/status and all DSH Goal state unchanged. This skips Goal activation-capacity checks but still rejects a conflicting binding or a different unfinished Goal. It does not stop an already armed Goal, launch an experiment, or automatically retry a finish.
+Human `/research-load <research-id>` detects open records and pending prepared transitions. It binds an idle session and returns `mode: recovery-only`, preserving research revision/status and durable Goal fields while disarming a matching armed Goal. Like every load, it queues only one tool-free briefing. Loading skips activation-capacity checks but still rejects conflicting bindings, different unfinished Goals and busy sessions. It never launches an experiment or retries a finish.
 
-`get_research` returns optional `research.recovery` with `run_id`, `phase`, `path`, and a planned `output_ref` for v2:
+`get_research` returns optional `research.recovery` with `run_id`, `phase`, `path`, and a planned `output_ref` for v2/v3; v3 additionally exposes its immutable `plan_ref`:
 
 - `open`: the JSONL has no result. This alone does not prove that execution happened or that the output ref exists. Check original execution evidence; if the output ref exists, read its commit-message journal and reuse `journal.prepared`. Do not rerun an experiment merely because publication failed.
 - `pending-state`: the run is closed but its exact prepared transition still needs publication. Read `result` from the run record.
 
 For an interrupted finish, reconstruct only the original caller fields: `status/result/metrics/decision/artifacts` from the stored result, and `research_status/summary/direction/next` from its `transition`. Preserve omitted optional fields. Do not substitute the current old target state or invent new result text. Existing immutable-payload checks remain the authority. For an open run with no sealed result, finish only after establishing the actual execution outcome.
 
-Recovery metadata is derived from authoritative run records, not a new persisted flag. Structured tool metadata is not context-truncated; a short recovery identity remains mandatory, with longer guidance ahead of optional glossary/history. Finishing removes recovery on the next read without activating a Goal. Have the human `/research-load` again afterward for normal resume (or view-only for a completed target). Legacy v1 recovery does not require Git.
+Recovery metadata is derived from authoritative run records, not a new persisted flag. Structured tool metadata is not context-truncated; a short recovery identity remains mandatory, with longer guidance ahead of optional glossary/history. Finishing removes recovery on the next read without activating a Goal. A later `/research-load` still only briefs. Use `/research-start` after explicit human authorization for continuous advancement; completed targets cannot be restarted. Legacy v1 recovery does not require Git.
 
 ## Inspecting and reproducing
 

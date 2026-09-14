@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GitCheckpointProvider } from '../src/checkpoint.ts'
 import { gitEnvironment, type GitRunner } from '../src/git-runtime.ts'
 import { ResearchStore } from '../src/storage.ts'
-import { failNextWrite, makeWorkspace, removeWorkspace, testContext, testSession } from './helpers.ts'
+import { failNextWrite, makeWorkspace, removeWorkspace, startPlannedTestRun, testContext, testSession } from './helpers.ts'
 import { recoveryHost } from './recovery-helpers.ts'
 
 const roots: string[] = []
@@ -38,7 +38,11 @@ describe('actual Git + ResearchStore checkpoint transaction', () => {
     const store = new ResearchStore(ctx, new GitCheckpointProvider(ctx, runner))
     const session = testSession(root)
     const target = await store.createTarget(session, { goal: 'Reproduce score 42', metrics: ['score = 42'], baseline: 'score = 0' })
-    const started = await store.startRun(session, target.id, { purpose: 'fixture', parameters: { seed: 7 }, reproduction: { command: 'node experiment.cjs', cwd: '.', inputs: [], environment: { node: process.versions.node } } })
+    const started = await startPlannedTestRun(store, session, target.id, { purpose: 'fixture', parameters: { seed: 7 }, reproduction: { command: 'node experiment.cjs', cwd: '.', inputs: [], environment: { node: process.versions.node } } })
+    const baseState = (await store.readTarget(session, target.id)).state
+    const selectedPlan = await store.getPlan(session, target.id, { planId: started.planRef.planId, revision: started.planRef.revision })
+    expect(started.planRef).toEqual(baseState.selectedPlanRef)
+    expect(started.planRef.sha256).toBe(selectedPlan.plan.sha256)
     const execute = (cwd: string) => new Promise<void>((resolve, reject) => execFile(process.execPath, ['experiment.cjs'], { cwd }, error => error ? reject(error) : resolve()))
     await execute(root)
     const request = { runId: started.runId, status: 'completed' as const, result: 'Score is 42', metrics: { score: 42 }, decision: 'keep', artifacts: ['answer.json'], researchStatus: 'active' as const, summary: 'Fixture complete' }
@@ -46,25 +50,34 @@ describe('actual Git + ResearchStore checkpoint transaction', () => {
     await expect(store.finishRun(session, target.id, request)).rejects.toThrow('interrupt after Git seal')
     const sealed = (await git('rev-parse', started.checkpoint.outputRef)).toString().trim()
     expect((await store.readRun(session, target.id, started.runId)).result).toBeUndefined()
-    expect((await store.readTarget(session, target.id)).state.revision).toBe(1)
+    expect((await store.readTarget(session, target.id)).state.revision).toBe(baseState.revision)
     await writeFile(path.join(root, 'experiment.cjs'), 'throw Error("later mutation")')
     await rm(path.join(root, 'answer.json'))
+    await rm(path.join(root, selectedPlan.path))
     const restarted = new ResearchStore(ctx, new GitCheckpointProvider(ctx, runner))
     const fresh = recoveryHost(ctx, restarted, root)
     const loaded = await fresh.service.load(fresh.agent, target.id)
-    expect(loaded.goalAction).toBe('recovery-only')
-    expect(loaded.target.recovery).toMatchObject({ runId: started.runId, phase: 'open', outputRef: started.checkpoint.outputRef })
+    expect(loaded.mode).toBe('recovery-only')
+    expect(loaded.target.recovery).toMatchObject({ runId: started.runId, phase: 'open', outputRef: started.checkpoint.outputRef, planRef: started.planRef })
+    expect(loaded.target.state.selectedPlanRef).toEqual(started.planRef)
+    expect(loaded.target.warnings.some(warning => warning.startsWith('Selected plan integrity error:'))).toBe(true)
     expect(fresh.goals.create).not.toHaveBeenCalled()
     // Discover the exact retry payload from the durable Git journal, not old session memory.
-    const prepared = JSON.parse((await git('show', '--no-patch', '--format=%B', loaded.target.recovery!.outputRef!)).toString()).prepared
+    const journal = JSON.parse((await git('show', '--no-patch', '--format=%B', loaded.target.recovery!.outputRef!)).toString())
+    expect(journal.version).toBe(2)
+    expect(journal.checkpoint).not.toHaveProperty('outputCommit')
+    const prepared = journal.prepared
+    expect(prepared).toMatchObject({ version: 3, planRef: started.planRef, transition: { version: 2, selectedPlanRef: started.planRef, revision: baseState.revision + 1 } })
+    expect(prepared).not.toHaveProperty('checkpoint')
     const retry = { runId: loaded.target.recovery!.runId, status: prepared.status, result: prepared.result, metrics: prepared.metrics, decision: prepared.decision, artifacts: prepared.artifacts, researchStatus: prepared.transition.status, summary: prepared.transition.summary }
     const finished = await fresh.service.finishRun(fresh.agent, retry)
     expect(finished.state).toEqual(prepared.transition)
+    expect(finished.planRef).toEqual(started.planRef)
     expect((await fresh.service.get(fresh.agent)).target.recovery).toBeUndefined()
     expect(fresh.goals.create).not.toHaveBeenCalled()
     expect(finished.checkpoint?.outputCommit).toBe(sealed)
     expect(finished.checkpoint?.codeChanged).toBe(false)
-    expect(finished.state.revision).toBe(2)
+    expect(finished.state.revision).toBe(baseState.revision + 1)
     expect(await readFile(path.join(root, '.git/index'))).toEqual(originalIndex)
     expect(await git('rev-parse', 'HEAD')).toEqual(originalHead)
     const restored = path.join(root, 'replay'); await mkdir(restored)
@@ -74,6 +87,6 @@ describe('actual Git + ResearchStore checkpoint transaction', () => {
     expect(JSON.parse(replay.toString())).toEqual(request.metrics)
     expect(createHash('sha256').update(replay).digest('hex')).toBe(finished.checkpoint!.artifacts[0]!.sha256)
     expect((await restarted.finishRun(session, target.id, request)).state).toEqual(finished.state)
-    expect((await readFile(path.join(root, target.root, 'state.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(2)
+    expect((await readFile(path.join(root, target.root, 'state.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(baseState.revision + 1)
   }, 30_000)
 })

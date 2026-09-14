@@ -3,7 +3,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { ResearcherError } from '../src/errors.ts'
 import { parseJsonText, researchSessionIndexSchema } from '../src/schema.ts'
-import { failNextWrite, makeWorkspace, newCheckpointStore, removeWorkspace, testContext, testReproduction, testSession } from './helpers.ts'
+import { failNextWrite, makeWorkspace, newCheckpointStore, removeWorkspace, testContext, testReproduction, testSession, startPlannedTestRun, ensureSelectedTestPlan } from './helpers.ts'
 
 let workspace: string
 
@@ -53,13 +53,13 @@ describe('ResearchStore integration', () => {
       metrics: ['score >= baseline'],
       baseline: 'score = 1',
     })
-    const started = await store.startRun(session, target.id, {
+    const started = await startPlannedTestRun(store, session, target.id, {
       purpose: 'seed 7 baseline',
       parameters: { seed: 7, nested: { mode: 'baseline' } },
       reproduction: testReproduction(),
     })
 
-    await expect(store.startRun(session, target.id, {
+    await expect(store.startRun(session, target.id, { plan: { planId: 1, revision: 1 },
       purpose: 'must wait',
       parameters: {},
       reproduction: testReproduction(),
@@ -90,15 +90,15 @@ describe('ResearchStore integration', () => {
     }
     const finished = await store.finishRun(session, target.id, request)
     expect(finished.runStatus).toBe('completed')
-    expect(finished.state).toMatchObject({ revision: 2, lastRunId: started.runId, status: 'active' })
+    expect(finished.state).toMatchObject({ revision: 3, lastRunId: started.runId, status: 'active' })
 
     const closed = await store.readRun(session, target.id, started.runId)
     expect(closed.result).toMatchObject({ status: 'completed', result: request.result })
-    expect((await store.finishRun(session, target.id, request)).state.revision).toBe(2)
+    expect((await store.finishRun(session, target.id, request)).state.revision).toBe(3)
     await expect(store.finishRun(session, target.id, { ...request, result: 'different immutable result' }))
       .rejects.toMatchObject({ code: 'RESEARCH_RUN_CLOSED' })
 
-    const next = await store.startRun(session, target.id, { purpose: 'seed 8', parameters: { seed: 8 }, reproduction: testReproduction() })
+    const next = await startPlannedTestRun(store, session, target.id, { purpose: 'seed 8', parameters: { seed: 8 }, reproduction: testReproduction() })
     expect(next.runId).not.toBe(started.runId)
 
     const encoded = 'dGVzdC9zZXNzaW9uOjE'
@@ -116,7 +116,7 @@ describe('ResearchStore integration', () => {
       metrics: ['one exact transition is published'],
       baseline: 'open run',
     })
-    const started = await store.startRun(session, target.id, { purpose: 'recoverable run', parameters: {}, reproduction: testReproduction() })
+    const started = await startPlannedTestRun(store, session, target.id, { purpose: 'recoverable run', parameters: {}, reproduction: testReproduction() })
     await mkdir(path.join(workspace, 'results'))
     const artifact = path.join(workspace, 'results', 'recover.json')
     await writeFile(artifact, '{"ok":true}\n')
@@ -135,14 +135,14 @@ describe('ResearchStore integration', () => {
     await failNextWrite(ctx, `${target.root}/state.jsonl`, 'simulated state publication failure', 'replaceIfVersion')
 
     await expect(store.finishRun(session, target.id, request)).rejects.toThrow(/simulated state publication failure/u)
-    expect((await store.readRun(session, target.id, started.runId)).result?.transition.revision).toBe(2)
-    expect((await store.readTarget(session, target.id)).state.revision).toBe(1)
+    expect((await store.readRun(session, target.id, started.runId)).result?.transition.revision).toBe(3)
+    expect((await store.readTarget(session, target.id)).state.revision).toBe(2)
 
     await rm(artifact)
     const recovered = await store.finishRun(session, target.id, request)
-    expect(recovered.state).toMatchObject({ revision: 2, lastRunId: started.runId })
+    expect(recovered.state).toMatchObject({ revision: 3, lastRunId: started.runId })
 
-    const newer = await store.startRun(session, target.id, { purpose: 'newer run', parameters: {}, reproduction: testReproduction() })
+    const newer = await startPlannedTestRun(store, session, target.id, { purpose: 'newer run', parameters: {}, reproduction: testReproduction() })
     await writeFile(path.join(workspace, 'results', 'newer.json'), '{}\n')
     await store.finishRun(session, target.id, {
       ...request,
@@ -210,13 +210,15 @@ describe('ResearchStore integration', () => {
       metrics: ['state is append-only'],
       baseline: 'active revision 1',
     })
+    await ensureSelectedTestPlan(store, session, target.id)
+    const selected = (await store.readTarget(session, target.id)).state.selectedPlanRef
     await store.appendState(session, target.id, { status: 'paused', summary: 'waiting for data', next: 'load data' })
     const resumed = await store.resumeState(session, target.id)
-    expect(resumed.state).toMatchObject({ status: 'active', revision: 3, summary: 'waiting for data' })
+    expect(resumed.state).toMatchObject({ status: 'active', revision: 4, summary: 'waiting for data', selectedPlanRef: selected })
     await store.appendState(session, target.id, { status: 'complete', summary: 'all criteria met' })
     await expect(store.appendState(session, target.id, { status: 'active', summary: 'reopen' }))
       .rejects.toMatchObject({ code: 'RESEARCH_TARGET_COMPLETE' })
-    await expect(store.startRun(session, target.id, { purpose: 'late run', parameters: {}, reproduction: testReproduction() }))
+    await expect(store.startRun(session, target.id, { plan: { planId: 1, revision: 1 }, purpose: 'late run', parameters: {}, reproduction: testReproduction() }))
       .rejects.toMatchObject({ code: 'RESEARCH_TARGET_COMPLETE' })
   })
 
@@ -242,7 +244,7 @@ describe('ResearchStore integration', () => {
     })).rejects.toMatchObject({ code: 'RESEARCH_OVERSIZED' })
     expect((await store.readTarget(session, target.id)).state).toMatchObject({ revision: 1, status: 'active' })
 
-    const run = await store.startRun(session, target.id, { purpose: 'oversized finish', parameters: {}, reproduction: testReproduction() })
+    const run = await startPlannedTestRun(store, session, target.id, { purpose: 'oversized finish', parameters: {}, reproduction: testReproduction() })
     await expect(store.finishRun(session, target.id, {
       runId: run.runId,
       status: 'completed',
@@ -254,7 +256,7 @@ describe('ResearchStore integration', () => {
       summary: 'x'.repeat(40_000),
     })).rejects.toMatchObject({ code: 'RESEARCH_OVERSIZED' })
     expect((await store.readRun(session, target.id, run.runId)).result).toBeUndefined()
-    expect((await store.readTarget(session, target.id)).state.revision).toBe(1)
+    expect((await store.readTarget(session, target.id)).state.revision).toBe(2)
   })
 
   it('isolates invalid targets and rejects authority-file symlinks', async () => {
