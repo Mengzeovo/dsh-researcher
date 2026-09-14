@@ -2,3 +2,12 @@ node_modules/
 coverage/
 *.log
 .DS_Store
+
+# Local research authority and machine-specific verification artifacts.
+/.research/
+/.artifacts/
+/generated/
+
+# Generated design previews; implementation documentation remains tracked.
+/docs/research-view-layout-mockup*
+/docs/research-view-revision-edges*
