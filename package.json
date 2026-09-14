@@ -57,7 +57,8 @@
     "docs/checkpoints.md",
     "docs/load-start.md",
     "docs/plans.md",
-    "docs/notebook.md"
+    "docs/notebook.md",
+    "docs/research-view.md"
   ],
   "dsh": {
     "engines": {
@@ -70,7 +71,9 @@
       "inject": [
         "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-api-session-controller",
-        "@deepseek-ai/dsh-client-ui-commands"
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "dsh-archify-native"
       ],
       "platform": "web"
     }

@@ -1,6 +1,8 @@
 /** Web decoration for bare /research-load using the DSH-owned popupSelect shell. */
 
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import viewRemote from '../view-remote-client.ts'
+import { installResearchView, VIEW_INJECT } from './view-apply.ts'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { CommandUiContract, SelectOption } from '@deepseek-ai/dsh-client-ui-commands/client'
@@ -10,6 +12,11 @@ import type { ResearchTargetList } from '../types.ts'
 export const inject = ['remote']
 const UI_INJECT = ['commandUi', 'sessions', 'remote', 'remote.researcher']
 const INVALID_PREFIX = 'invalid:'
+// Typert owns one registration per package, including all its Remote namespaces.
+const clientRemote = {
+  package: researcherRemote.package,
+  descriptors: [...researcherRemote.descriptors, ...viewRemote.descriptors],
+}
 
 export function researchOptions(list: ResearchTargetList): SelectOption[] {
   const valid = list.targets.map(target => ({
@@ -60,18 +67,42 @@ function installResearchUi(ctx: ClientContext): () => void {
   })
 }
 
+/** Fetch the Host's public settings before installing optional view services. */
 export async function apply(ctx: ClientContext): Promise<() => Promise<void>> {
-  const disposeRemote = await ctx.remote.$mount(researcherRemote)
-  const uiFiber = ctx.inject(UI_INJECT, installResearchUi)
-  try {
-    await uiFiber
-    return async () => {
-      await uiFiber.dispose()
-      await disposeRemote()
+  const lifecycle = new AbortController()
+  ctx.effect(() => () => lifecycle.abort(), 'researcher: configuration handshake')
+  // A pending async plugin cannot drain its effects until startup settles.
+  ctx.on('internal/plugin', fiber => {
+    if (fiber === ctx.fiber && fiber.uid === null) lifecycle.abort()
+  })
+  let disposeRemote: (() => Promise<void>) | undefined
+  let uiFiber: ReturnType<ClientContext['inject']> | undefined
+  let viewFiber: ReturnType<ClientContext['inject']> | undefined
+  const dispose = async () => {
+    lifecycle.abort()
+    try { await viewFiber?.dispose() } finally {
+      try { await uiFiber?.dispose() } finally { await disposeRemote?.() }
     }
+  }
+  try {
+    disposeRemote = await ctx.remote.$mount(clientRemote)
+    lifecycle.signal.throwIfAborted()
+    const researcher = ctx.get('remote.researcher')
+    if (researcher === undefined) throw new Error('researcher configuration namespace did not mount')
+    const result = await researcher.getViewConfig(lifecycle.signal)
+    lifecycle.signal.throwIfAborted()
+    if (!result.ok) throw new Error('researcher view configuration failed: ' + result.error.message)
+    // A non-constructible callback lets Cordis collect the returned picker disposer.
+    uiFiber = ctx.inject(UI_INJECT, uiCtx => installResearchUi(uiCtx))
+    if (result.value.enabled) {
+      viewFiber = ctx.inject(VIEW_INJECT, viewCtx => installResearchView(viewCtx, result.value.presetIds))
+    }
+    await uiFiber
+    await viewFiber
+    lifecycle.signal.throwIfAborted()
+    return dispose
   } catch (error) {
-    await uiFiber.dispose()
-    await disposeRemote()
+    await dispose()
     throw error
   }
 }

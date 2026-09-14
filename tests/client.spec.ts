@@ -68,12 +68,15 @@ describe('client Remote mount and popupSelect decoration', () => {
       }),
     }
     const disposeUi = vi.fn(async () => {})
+    const researcher = { list: listRemote, getViewConfig: vi.fn(async () => ({ ok: true, value: { enabled: false, presetIds: ['research'] } })) }
     const ctx = {
+      effect: vi.fn((callback: () => () => void) => callback()),
+      on: vi.fn(),
       remote: {
         $mount: mount,
-        researcher: { list: listRemote },
+        researcher,
       },
-      get: (name: string) => name === 'commandUi' ? commandUi : sessions,
+      get: (name: string) => name === 'remote.researcher' ? researcher : name === 'commandUi' ? commandUi : sessions,
       inject: vi.fn((_deps, callback: (injected: Context) => void | (() => void)) => {
         const dispose = callback(ctx as unknown as Context)
         return Object.assign(Promise.resolve(), {

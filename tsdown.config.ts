@@ -3,6 +3,11 @@ import { defineConfig } from 'tsdown'
 const id = 'dsh-profile-researcher'
 const clientExternals = new Set([
   '@deepseek-ai/cordis',
+  'react',
+  'react/jsx-runtime',
+  '@deepseek-ai/dsh-client-store',
+  '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-client-ui-primitives',
   '@deepseek-ai/dsh-api-remotes',
   '@deepseek-ai/dsh-api-session-controller',
   '@deepseek-ai/dsh-client-ui-commands',
