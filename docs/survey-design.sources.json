@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "record_type": "consultation_source_register",
+  "status": "design_only",
+  "retrieved_on_utc": "2026-09-06",
+  "question": "研究工作流的可选背景／现状调研应如何组织来源、渐进式报告和结构化持久记录？",
+  "scope": "定向咨询，非系统综述；分层、预算和 schema 均为产品建议，尚未验证效果。",
+  "report_path": "docs/survey-design.md",
+  "method": {
+    "parent_web_search_calls": 3,
+    "parent_original_sources_verified": 6,
+    "subagent_original_sources_verified": 1,
+    "external_originals_archived": false,
+    "experiments_executed": 0,
+    "limitations": [
+      "原文核查主要针对相关章节，不表示逐字读完所有页面。",
+      "未测试任何平台 API 的实际集成、配额、费用或全文权限。",
+      "未保存完整网页/PDF快照或其字节摘要，未来页面可能变化；此登记不是完整检索复现包。",
+      "仅核对现有工作流和项目文档，没有审计插件全部实现。",
+      "未成功读取 PRISMA-ScR 或 PRISMA-S 原文，不宣称 PRISMA 合规。"
+    ]
+  },
+  "local_context": [
+    {
+      "path": "README.zh.md",
+      "sections": "各层职责、项目目录、方案记录、可靠性约束"
+    },
+    {
+      "path": "docs/plans.md",
+      "sections": "背景调查可选；纯读取/检索不转化为 run；记录与选择边界"
+    },
+    {
+      "path": "/home/mz/.dsh/.agent-presets/research/skills/research-workflow/WORKFLOW.md",
+      "sections": "阶段 B；研究状态、报告与主循环边界"
+    }
+  ],
+  "sources": [
+    {
+      "source_id": "S01",
+      "title": "Google Scholar Search Help",
+      "authors_or_organization": [
+        "Google Scholar"
+      ],
+      "published_at": null,
+      "url": "https://scholar.google.com/intl/en/scholar/help.html",
+      "accessed_on": "2026-09-06",
+      "http_status": 200,
+      "source_type": "official_documentation",
+      "read_level": "selected_sections",
+      "verified_by": "parent",
+      "locators": [
+        "Content Coverage",
+        "Locating the full text of an article",
+        "How do I get bulk access to records in Google Scholar?"
+      ],
+      "findings": [
+        "覆盖多学科、多类型学术材料，包括期刊、会议、预印本和摘要。",
+        "读全文可能需要订阅，可通过其他版本或图书馆寻找合法全文。",
+        "官方明确不提供批量记录访问。"
+      ],
+      "short_excerpt": "Sorry, we're unable to provide bulk access.",
+      "design_inference": "作为发现入口；自动化后端优先考虑有正式 API 的索引服务，不把 Scholar 网页抓取作为基础依赖。",
+      "limitations": "未测试搜索质量、覆盖率或自动化访问。"
+    },
+    {
+      "source_id": "S02",
+      "title": "Publications – Google Research",
+      "authors_or_organization": [
+        "Google Research"
+      ],
+      "published_at": null,
+      "url": "https://research.google/pubs/",
+      "accessed_on": "2026-09-06",
+      "http_status": 200,
+      "source_type": "institutional_publications",
+      "read_level": "selected_sections",
+      "verified_by": "parent",
+      "locators": [
+        "Publications introduction",
+        "Year / Team / Research Area filters"
+      ],
+      "findings": [
+        "页面以本机构团队研究与工具分享为定位，并按年份、团队和领域提供成果浏览。"
+      ],
+      "short_excerpt": "Our teams aspire to make discoveries that impact everyone",
+      "design_inference": "作为机构成果种子源，不等同于跨机构学术搜索引擎。",
+      "limitations": "未核验所列论文全文，不代表全领域覆盖。"
+    },
+    {
+      "source_id": "S03",
+      "title": "Semantic Scholar Academic Graph API",
+      "authors_or_organization": [
+        "Semantic Scholar"
+      ],
+      "published_at": null,
+      "url": "https://www.semanticscholar.org/product/api",
+      "accessed_on": "2026-09-06",
+      "http_status": 200,
+      "source_type": "official_documentation",
+      "read_level": "selected_sections",
+      "verified_by": "parent",
+      "locators": [
+        "Why use Semantic Scholar API?",
+        "Academic Graph / Recommendations / Datasets"
+      ],
+      "findings": [
+        "API 提供作者、论文、引用和发表场所等数据。",
+        "另有推荐论文与数据集相关服务。"
+      ],
+      "short_excerpt": "Provides recommended papers similar to a given paper.",
+      "design_inference": "可作为发现、引文扩展与结构化元数据获取的候选后端。",
+      "limitations": "没有执行 API 请求或核验账户配额、收费、授权与全文可用性。"
+    },
+    {
+      "source_id": "S04",
+      "title": "Works Overview | OpenAlex Help Center",
+      "authors_or_organization": [
+        "OpenAlex"
+      ],
+      "published_at": null,
+      "page_last_updated": "2026-08-08",
+      "requested_url": "https://developers.openalex.org/api-reference/works",
+      "url": "https://help.openalex.org/data/works/",
+      "accessed_on": "2026-09-06",
+      "http_status": 200,
+      "source_type": "official_documentation",
+      "read_level": "selected_sections",
+      "verified_by": "parent",
+      "locators": [
+        "About",
+        "In the API"
+      ],
+      "findings": [
+        "work 记录包含标题、摘要、日期、类型及作者、机构、来源、主题、引用等关联。",
+        "Works API 支持列表检索、筛选、排序、分组和分页。"
+      ],
+      "short_excerpt": "The Works endpoint is at api.openalex.org/works",
+      "design_inference": "可作为跨来源元数据与检索后端候选；与原文阅读分开设计。",
+      "limitations": "未执行 API 请求；未验证具体记录完整性、授权与配额。"
+    },
+    {
+      "source_id": "S05",
+      "title": "IEEE Xplore – Currently Available APIs",
+      "authors_or_organization": [
+        "IEEE Xplore"
+      ],
+      "published_at": null,
+      "url": "https://developer.ieee.org/docs/read/",
+      "accessed_on": "2026-09-06",
+      "http_status": 200,
+      "source_type": "official_documentation",
+      "read_level": "selected_sections",
+      "verified_by": "parent",
+      "locators": [
+        "Metadata Search API",
+        "IEEE Open Access API",
+        "IEEE Full-Text Access API"
+      ],
+      "findings": [
+        "元数据接口包括摘要，页面另列开放获取与收费全文相关接口。"
+      ],
+      "short_excerpt": "Query and retrieve metadata records including abstracts",
+      "design_inference": "为元数据发现与实际全文读取分别记录能力、权限和访问状态。",
+      "limitations": "接口名称不是本会话拥有访问权或免费全文的证明；本轮未测试接口。"
+    },
+    {
+      "source_id": "S06",
+      "title": "Extrinsic Hallucinations in LLMs",
+      "authors_or_organization": [
+        "Lilian Weng"
+      ],
+      "published_at": "2024-07-07",
+      "url": "https://lilianweng.github.io/posts/2024-07-07-hallucination/",
+      "discovery_url": "https://lilianweng.github.io/",
+      "accessed_on": "2026-09-06",
+      "http_status": 200,
+      "source_type": "researcher_blog",
+      "read_level": "selected_sections",
+      "verified_by": "parent",
+      "locators": [
+        "Article header: author and date",
+        "Table of Contents",
+        "Citation / References headings"
+      ],
+      "findings": [
+        "文章标注作者和日期，按问题原因、检测、缓解方法等组织目录，并提供引文与参考资料章节。"
+      ],
+      "short_excerpt": "Date: July 7, 2024",
+      "design_inference": "可作为 AI/LLM 领域解释型内容与分类写法的种子示例；比较性论断仍需回到原始证据。",
+      "limitations": "本轮仅检查结构与相关片段，不验证文章全部技术结论；不是对整站或其他主题的背书。"
+    },
+    {
+      "source_id": "S07",
+      "title": null,
+      "display_label": "Wohlin 2014 引文追踪方法论文",
+      "authors_or_organization": [
+        "Wohlin"
+      ],
+      "published_at": null,
+      "publication_year": 2014,
+      "url": "https://www.wohlin.eu/ease14.pdf",
+      "accessed_on": "2026-09-06",
+      "http_status": 200,
+      "source_type": "author_hosted_methodology_paper",
+      "read_level": "selected_sections",
+      "full_document_text_extracted": true,
+      "verified_by": "subagent:d39f38be-0eaf-4da2-9df0-2fd30fa789f7",
+      "locators": [
+        "Section 3.2.1",
+        "Section 3.2.2",
+        "Section 3.3"
+      ],
+      "findings": [
+        "后向引文追踪利用参考文献识别新论文。",
+        "前向引文追踪寻找引用该文的论文。",
+        "讨论无新论文时结束迭代。"
+      ],
+      "short_excerpt": "using the reference list to identify new papers",
+      "design_inference": "在主题检索后，以已筛选种子做双向补查；本产品允许预算耗尽时交付非穷尽结果。",
+      "limitations": "原文研究语境为软件工程；跨领域适用性和本稿预算规则是迁移建议。子代理未回传完整书目信息，故不补造标题或 DOI。"
+    }
+  ],
+  "access_failures": [
+    {
+      "url": "https://bair.berkeley.edu/blog/",
+      "checked_by": "parent",
+      "error": "SSL UNEXPECTED_EOF_WHILE_READING",
+      "used_as_evidence": false
+    },
+    {
+      "url": "https://www.equator-network.org/wp-content/uploads/2018/09/PRISMA-ScR-Fillable-Checklist-1.pdf",
+      "checked_by": "subagent:d39f38be-0eaf-4da2-9df0-2fd30fa789f7",
+      "error": "TLS handshake timeout",
+      "used_as_evidence": false
+    },
+    {
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC7839230/",
+      "checked_by": "subagent:d39f38be-0eaf-4da2-9df0-2fd30fa789f7",
+      "error": "SSL EOF",
+      "used_as_evidence": false
+    }
+  ],
+  "search_log": {
+    "parent_query_batches": [
+      [
+        "Google Scholar search help coverage Google Research publications site:scholar.google.com",
+        "Semantic Scholar Academic Graph API OpenAlex works search official documentation",
+        "Stanford STORM research outline grounded citations multi perspective Wikipedia writing paper"
+      ],
+      [
+        "site.scholar.google.com/intl/en/scholar/help.html search tips coverage",
+        "site.research.google/pubs/ publications",
+        "site.semanticscholar.org/product/api API citations references",
+        "site.docs.openalex.org works search"
+      ],
+      [
+        "site:scholar.google.com \"Search Help\" \"Coverage\"",
+        "site:semanticscholar.org/product/api \"Academic Graph\"",
+        "site:developer.ieee.org \"API\" \"Metadata\"",
+        "site:lilianweng.github.io \"About\""
+      ]
+    ],
+    "limitations": "第二批原始查询中的 site. 并非标准 site: 限定语法，结果偏离目标，随后使用更明确查询及官方页面核查；搜索摘要不作全文证据。未核验 STORM，不用于支撑方案。",
+    "subagent_web_search_calls": 4,
+    "subagent_queries": null,
+    "subagent_log_limitation": "仅收到调用次数、核验结果与访问限制，未回传逐条检索式。"
+  }
+}
