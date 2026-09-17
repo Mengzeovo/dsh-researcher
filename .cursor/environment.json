@@ -1,0 +1,4 @@
+{
+  "name": "dsh-profile-researcher",
+  "install": "bash .cursor/setup-harness.sh"
+}
