@@ -11,7 +11,8 @@ const renderRequest = { sessionId: 'view/test', snapshotId: hash, theme: 'light'
 
 describe('research view JSON validation', () => {
   it('rejects malformed page selections and unknown request fields', () => {
-    expect(researchViewRequestSchema.parse({ sessionId: 'view/test', planId: 1, versionPage: 0, runPages: { 1: 0 }, ifNoneMatch: hash })).toMatchObject({ planId: 1 })
+    const canonical = { sessionId: 'view/test', planId: 1, runPages: { 1: 0 }, ifNoneMatch: hash }
+    for (const versionPage of [0, 1, 999]) expect(researchViewRequestSchema.parse({ ...canonical, versionPage })).toEqual(canonical)
     for (const patch of [{ sessionId: '' }, { sessionId: '  ' }, { planId: 0 }, { planId: 1.5 }, { planId: Number.MAX_SAFE_INTEGER + 1 }, { versionPage: -1 }, { versionPage: 0.2 }, { runPages: { 0: 1 } }, { runPages: { 1: -1 } }, { runPages: { '../path': 1 } }, { ifNoneMatch: 'bad' }, { extra: true }]) {
       expect(researchViewRequestSchema.safeParse({ sessionId: 'view/test', ...patch }).success).toBe(false)
     }
@@ -33,10 +34,26 @@ describe('research view JSON validation', () => {
     expect(researchViewResponseSchema.safeParse({ kind: 'unbound' }).success).toBe(true)
     expect(researchViewResponseSchema.safeParse({ kind: 'unchanged', snapshotId: hash }).success).toBe(true)
     const run = snapshot.nodes.find(node => node.kind === 'run')!
-    for (const patch of [{ status: 'running' }, { pendingState: 'false' }, { slot: 4 }, { column: 6 }, { extra: 1 }, { metrics: { bad: Infinity } }]) {
+    for (const column of [6, 7, 13, 100]) {
+      expect(researchViewResponseSchema.safeParse({ ...snapshot, nodes: [{ ...run, column }] }).success).toBe(true)
+    }
+    for (const patch of [{ status: 'running' }, { pendingState: 'false' }, { slot: 4 }, { column: -1 }, { column: 0.5 }, { column: Number.MAX_SAFE_INTEGER + 1 }, { extra: 1 }, { metrics: { bad: Infinity } }]) {
       expect(researchViewResponseSchema.safeParse({ ...snapshot, nodes: [{ ...run, ...patch }] }).success).toBe(false)
     }
     for (const patch of [{ extra: true }, { selection: { ...snapshot.selection, extra: true } }, { state: { ...snapshot.state, selectedPlanRef: { planId: 1, revision: 1, sha256: 'bad' } } }, { pages: { ...snapshot.pages, versionsPerPage: 4 } }]) expect(researchViewResponseSchema.safeParse({ ...snapshot, ...patch }).success).toBe(false)
+  })
+
+  it('round-trips every revision of a four-version plan and ignores obsolete page selection', async () => {
+    const f = await viewFixture()
+    for (let revision = 1; revision < 4; revision++) await f.addVersion(1, revision)
+    const data = await f.read()
+    const request = researchViewRequestSchema.parse({ sessionId: 'view/test', versionPage: 999 })
+    const { snapshot } = projectResearchView(data, hash as ResearchViewTargetToken, request, viewConfig)
+    expect(researchViewResponseSchema.parse(snapshot)).toEqual(snapshot)
+    expect(snapshot.nodes.map(node => [node.revision, node.column])).toEqual([[1, 0], [2, 2], [3, 4], [4, 6]])
+    expect(snapshot.selection).not.toHaveProperty('versionPage')
+    expect(snapshot.pages).not.toHaveProperty('versionPages')
+    expect(projectResearchView(data, hash as ResearchViewTargetToken, { sessionId: 'view/test' }, viewConfig).snapshot.snapshotId).toBe(snapshot.snapshotId)
   })
 
   it('keeps opaque Run JSON inspection separate from semantic node validation', async () => {

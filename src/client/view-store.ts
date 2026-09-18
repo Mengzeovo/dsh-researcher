@@ -11,10 +11,10 @@ export interface ResearchViewUiState {
   pagesByPlan: Record<string, ResearchViewSelection>
   cameras: Record<string, ArchifyCamera>
 }
-const firstPage = (planId: number | null): ResearchViewSelection => ({ planId, versionPage: 0, runPages: {} })
+const firstPage = (planId: number | null): ResearchViewSelection => ({ planId, runPages: {} })
 function choose(draft: ResearchViewUiState, selection: ResearchViewSelection, nodeId: ResearchViewNodeId | null): void {
   draft.pagesByPlan[String(draft.selection.planId)] = draft.selection
-  draft.selection = selection
+  draft.selection = { planId: selection.planId, runPages: selection.runPages }
   draft.selectedNodeId = nodeId
 }
 /** Each session-scoped slot instance retains navigation independently of React mounts. */
@@ -38,7 +38,10 @@ export function createResearchViewStore() {
           draft.cameras = {}
           draft.selectedNodeId = null
         }
-        if (viewPageKey(draft.selection) !== viewPageKey(selection)) draft.selection = selection
+        // Normalize retained pre-upgrade state without reintroducing revision paging.
+        if ('versionPage' in draft.selection || viewPageKey(draft.selection) !== viewPageKey(selection)) {
+          draft.selection = { planId: selection.planId, runPages: selection.runPages }
+        }
         if (draft.selectedNodeId !== null && !nodeIds.includes(draft.selectedNodeId)) draft.selectedNodeId = null
       },
       setCamera: (draft: ResearchViewUiState, key: string, camera: ArchifyCamera) => {

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
-import { lstat, mkdtemp, open, readdir, realpath, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, open, readdir, readlink, realpath, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import type { Context } from '@deepseek-ai/cordis'
@@ -9,7 +9,7 @@ import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { ResearcherError } from './errors.ts'
-import { preparedPlanRunResultSchema } from './schema.ts'
+import { preparedPlanRunResultSchema, reproductionSchema } from './schema.ts'
 import { createGitRunner, GIT_SAFETY_ARGS, gitEnvironment, type GitResult, type GitRunner } from './git-runtime.ts'
 
 export interface ReproductionSpec {
@@ -18,6 +18,8 @@ export interface ReproductionSpec {
   /** Descriptive lossless JSON only; NEVER passed to a subprocess. */
   environment: Readonly<Record<string, JsonValue>>
   inputs: readonly string[]
+  /** Opt-in partial working-tree overlay. Omitted means historical all-tracked capture. */
+  snapshot?: { mode: 'scoped'; paths: readonly string[]; externalInputs?: readonly ArtifactDigest[] | undefined; omitChanges?: readonly string[] | undefined } | undefined
 }
 export interface InputCheckpoint {
   backend: 'git'
@@ -29,6 +31,7 @@ export interface InputCheckpoint {
   objectFormat: 'sha1' | 'sha256'
   files: readonly string[]
   reproduction: ReproductionSpec
+  snapshot?: { mode: 'scoped-overlay'; deleted: readonly string[]; omittedChanges: readonly string[] } | undefined
 }
 export interface ArtifactDigest { path: string; sha256: string; bytes: number }
 export interface OutputCheckpoint {
@@ -42,6 +45,7 @@ export interface OutputCheckpoint {
   objectFormat: 'sha1' | 'sha256'
   artifacts: readonly ArtifactDigest[]
   codeChanged: boolean
+  snapshot?: { mode: 'scoped-overlay'; baseHead: string; deleted: readonly string[] } | undefined
 }
 
 export const CHECKPOINT_MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -250,8 +254,8 @@ export class GitCheckpointProvider {
     } finally { await handle.close() }
   }
 
-  /** Check every ancestor, rejecting symlinks and nested repositories before opening. */
-  private async fileStat(repo: Repo, file: string, directory = false): Promise<BigIntStats | undefined> {
+  /** Ancestors, cwd and explicit inputs/artifacts remain no-follow; only tracked leaf links may be captured. */
+  private async fileStat(repo: Repo, file: string, directory = false, allowLeafSymlink = false): Promise<BigIntStats | undefined> {
     const parts = relativePath(file, directory).split('/')
     if (file === '.' && directory) return await lstat(repo.root, { bigint: true })
     let current = repo.root
@@ -259,7 +263,10 @@ export class GitCheckpointProvider {
       current = path.join(current, parts[index]!)
       const stat = await maybeStat(current)
       if (stat === undefined) return undefined
-      if (stat.isSymbolicLink()) invalid(`symlink checkpoint path is unsupported: ${file}`)
+      if (stat.isSymbolicLink()) {
+        if (allowLeafSymlink && !directory && index === parts.length - 1) return stat
+        invalid(`symlink checkpoint path is unsupported: ${file}`)
+      }
       const isDirectory = index < parts.length - 1 || directory
       if (isDirectory) {
         if (!stat.isDirectory()) invalid(`checkpoint path ancestor is not a directory: ${file}`)
@@ -275,20 +282,20 @@ export class GitCheckpointProvider {
   private async verify(repo: Repo, stamps: readonly Stamp[]): Promise<void> {
     for (const stamp of stamps) {
       canceled(repo.signal)
-      if (!sameStat(stamp.stat, await this.fileStat(repo, stamp.path))) invalid(`file changed before checkpoint publication: ${stamp.path}`)
+      if (!sameStat(stamp.stat, await this.fileStat(repo, stamp.path, false, stamp.stat?.isSymbolicLink() === true))) invalid(`file changed before checkpoint publication: ${stamp.path}`)
     }
   }
   private async noMerge(repo: Repo): Promise<void> {
     if (await maybeStat(path.join(repo.gitDir, 'MERGE_HEAD'))) invalid('unresolved or uncommitted merge is unsupported')
     if ((await this.ok(repo, ['ls-files', '--unmerged', '-z'])).length !== 0) invalid('unresolved index merge is unsupported')
   }
-  private async tracked(repo: Repo, base: string): Promise<string[]> {
+  private async tracked(repo: Repo, base: string, scopes?: readonly string[]): Promise<string[]> {
     const names = new Set<string>()
     const add = (mode: string, file: string): void => {
       if (mode === '160000') invalid('Git submodules are unsupported')
-      if (excluded(file)) return
+      if (excluded(file) || (scopes && !this.inScope(file, scopes))) return
       safeFile(file)
-      if (mode !== '100644' && mode !== '100755') invalid(`non-regular tracked entry is unsupported: ${file}`)
+      if (mode !== '100644' && mode !== '100755' && mode !== '120000') invalid(`unsupported tracked entry mode: ${file}`)
       names.add(file)
     }
     for (const entry of decode(await this.ok(repo, ['ls-files', '--stage', '-z'])).split('\0').filter(Boolean)) {
@@ -303,30 +310,88 @@ export class GitCheckpointProvider {
     }
     return [...names]
   }
-  private async capture(repo: Repo, files: readonly string[], required: ReadonlySet<string>): Promise<{ entries: CapturedFile[]; stamps: Stamp[] }> {
+  /** Capture link text, never target contents. Only relative targets lexically inside the workspace are accepted. */
+  private async readTrackedSymlink(repo: Repo, file: string, stat: BigIntStats): Promise<{ bytes: Buffer; stat: BigIntStats }> {
+    canceled(repo.signal)
+    const absolute = path.join(repo.root, file)
+    const bytes = await readlink(absolute, { encoding: 'buffer' })
+    if (bytes.length > CHECKPOINT_MAX_FILE_BYTES || !sameStat(stat, await maybeStat(absolute))) {
+      invalid(`symlink changed while reading or exceeds size limit: ${file}`)
+    }
+    this.validateLinkTarget(repo, file, bytes)
+    return { bytes, stat }
+  }
+  private validateLinkTarget(repo: Repo, file: string, bytes: Buffer): void {
+    const target = decode(bytes)
+    const resolved = path.resolve(repo.root, path.dirname(file), target)
+    if (!target || path.isAbsolute(target) || !inside(repo.root, resolved)) invalid(`unsafe tracked symlink target: ${file}`)
+    safeFile(path.relative(repo.root, resolved))
+  }
+
+  private async capture(repo: Repo, files: readonly string[], required: ReadonlySet<string>, regularOnly: ReadonlySet<string> = required): Promise<{ entries: CapturedFile[]; stamps: Stamp[] }> {
     if (files.length > CHECKPOINT_MAX_FILES) invalid('checkpoint exceeds 2000 file limit')
     let bytes = 0
     const entries: CapturedFile[] = []
     const stamps: Stamp[] = []
     for (const file of files) {
       safeFile(file)
-      const stat = await this.fileStat(repo, file)
+      const stat = await this.fileStat(repo, file, false, !regularOnly.has(file))
       if (stat === undefined) {
         if (required.has(file)) invalid(`explicit input file is missing: ${file}`)
         stamps.push({ path: file, stat: undefined })
         continue
       }
-      const captured = await this.readRegular(path.join(repo.root, file), CHECKPOINT_MAX_FILE_BYTES, repo.signal)
+      const captured = stat.isSymbolicLink()
+        ? await this.readTrackedSymlink(repo, file, stat)
+        : await this.readRegular(path.join(repo.root, file), CHECKPOINT_MAX_FILE_BYTES, repo.signal)
       if (!sameStat(stat, captured.stat)) invalid(`file changed before checkpoint read: ${file}`)
       if (SECRET_CONTENT.test(captured.bytes.toString('latin1'))) invalid(`private key content cannot be checkpointed: ${file}`)
       bytes += captured.bytes.length
       if (bytes > CHECKPOINT_MAX_SNAPSHOT_BYTES) invalid('checkpoint exceeds 50 MiB snapshot limit')
       const stamp = { path: file, stat: captured.stat }
       stamps.push(stamp)
-      entries.push({ ...stamp, bytes: captured.bytes, mode: (captured.stat.mode & 0o111n) !== 0n ? '100755' : '100644' })
+      entries.push({ ...stamp, bytes: captured.bytes, mode: captured.stat.isSymbolicLink() ? '120000' : (captured.stat.mode & 0o111n) !== 0n ? '100755' : '100644' })
     }
     return { entries, stamps }
   }
+  private inScope(file: string, scopes: readonly string[]): boolean {
+    return scopes.some(scope => file === scope || file.startsWith(scope + '/'))
+  }
+
+  /** Enumerate names only outside the opt-in scope, never working-file contents. */
+  private async scopedInventory(repo: Repo, baseHead: string, repro: ReproductionSpec, frozenFiles: readonly string[] = []): Promise<{ files: string[]; omittedChanges: string[] }> {
+    const spec = repro.snapshot!
+    const scopes = spec.paths.map(safeFile)
+    const external = new Set((spec.externalInputs ?? []).map(item => safeFile(item.path)))
+    const explicit = new Set(repro.inputs.map(safeFile))
+    const tracked = await this.tracked(repo, baseHead, scopes)
+    const selected = new Set([...tracked.filter(file => !external.has(file)), ...explicit])
+    const declared = new Set([...selected, ...external])
+    for (const scope of scopes) {
+      const stat = await maybeStat(path.join(repo.root, scope))
+      await this.fileStat(repo, scope, stat?.isDirectory() === true, true)
+      if (![...declared, ...frozenFiles].some(file => this.inScope(file, [scope]))) invalid(`scope matches no declared tracked/input files: ${scope}`)
+    }
+    const untracked = decode(await this.ok(repo, ['ls-files', '--others', '--exclude-standard', '-z', '--', ...scopes.map(scope => ':(literal)' + scope)])).split('\0').filter(Boolean)
+    for (const file of untracked) {
+      if (!excluded(file) && !declared.has(file)) invalid(`untracked scoped file must be declared in reproduction.inputs or externalInputs: ${file}`)
+    }
+    const changed = decode(await this.ok(repo, ['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', baseHead, '--'])).split('\0').filter(Boolean)
+    const omittedChanges = [...new Set(changed.filter(file => !excluded(file) && !declared.has(file)).map(file => relativePath(file)))].sort()
+    if (omittedChanges.length > CHECKPOINT_MAX_FILES) invalid('too many omitted tracked changes to report within checkpoint limits')
+    const acknowledged = [...(spec.omitChanges ?? [])].map(safeFile).sort()
+    if (!isDeepStrictEqual(acknowledged, omittedChanges)) invalid('outside-scope tracked changes require an exact snapshot.omitChanges acknowledgement: ' + JSON.stringify(omittedChanges))
+    return { files: [...selected].sort(), omittedChanges }
+  }
+
+  /** Retained data are checked by streaming, not stored in the code tree. */
+  private async externalInputs(repo: Repo, repro: ReproductionSpec): Promise<Stamp[]> {
+    const expected = repro.snapshot?.externalInputs ?? []
+    const actual = await this.artifacts(repo, expected.map(item => item.path))
+    if (!isDeepStrictEqual(actual.artifacts, expected)) invalid('external input size or SHA-256 mismatch; no checkpoint published')
+    return actual.stamps
+  }
+
   private async tree(repo: Repo, entries: readonly CapturedFile[]): Promise<string> {
     // mkdtemp is the only direct filesystem write; gated by repo() and confined root.
     const temp = await mkdtemp(path.join(repo.gitDir, 'dsh-index-'))
@@ -384,6 +449,27 @@ export class GitCheckpointProvider {
     const { inputCommit: _commit, ...body } = input
     return body
   }
+  private async validateOverlayTree(repo: Repo, tree: string, files: readonly string[], deleted: readonly string[], explicit: readonly string[]): Promise<void> {
+    const rows = decode(await this.ok(repo, ['ls-tree', '-r', '-l', '-z', tree])).split('\0').filter(Boolean)
+    const names: string[] = []
+    let totalBytes = 0
+    for (const row of rows) {
+      const entry = /^([0-7]+) (\S+) ([0-9a-f]+) +([0-9]+|-)\t(.+)$/u.exec(row)
+      if (!entry || entry[2] !== 'blob' || !['100644', '100755', '120000'].includes(entry[1]!)) invalid('unsupported overlay entry mode/type')
+      const file = safeFile(entry[5]!)
+      const bytes = Number(entry[4])
+      totalBytes += bytes
+      if (!Number.isSafeInteger(bytes) || bytes > CHECKPOINT_MAX_FILE_BYTES || totalBytes > CHECKPOINT_MAX_SNAPSHOT_BYTES || names.length >= CHECKPOINT_MAX_FILES) invalid('overlay tree exceeds snapshot limits')
+      if (entry[1] === '120000') {
+        if (explicit.includes(file)) invalid('explicit input cannot be a symlink in an overlay')
+        this.validateLinkTarget(repo, file, await this.ok(repo, ['cat-file', 'blob', entry[3]!]))
+      }
+      names.push(file)
+    }
+    const expectedDeleted = files.filter(file => !names.includes(file)).sort()
+    if (names.some(file => !files.includes(file)) || !isDeepStrictEqual([...deleted].sort(), expectedDeleted)) invalid('overlay tree and deletion manifest disagree')
+  }
+
   private async validateInput(repo: Repo, input: InputCheckpoint): Promise<void> {
     const match = REF.exec(input.inputRef)
     if (!match || input.outputRef !== input.inputRef.replace(/\/input$/u, '/output') || input.backend !== 'git' || input.objectFormat !== repo.format) invalid('invalid checkpoint input identity')
@@ -391,16 +477,22 @@ export class GitCheckpointProvider {
     if (await this.ref(repo, input.inputRef) !== input.inputCommit) invalid('immutable input checkpoint ref no longer matches run')
     const stored = await this.readCommit(repo, input.inputCommit)
     if (stored.tree !== input.inputTree || !isDeepStrictEqual(stored.parents, [input.baseHead])
-      || !isDeepStrictEqual(stored.body, { version: 1, type: 'dsh-research-input', checkpoint: this.inputBody(input) })) invalid('input checkpoint journal does not match run identity')
+      || !isDeepStrictEqual(stored.body, { version: input.snapshot ? 2 : 1, type: 'dsh-research-input', checkpoint: this.inputBody(input) })) invalid('input checkpoint journal does not match run identity')
+    if ((input.snapshot !== undefined) !== (input.reproduction.snapshot !== undefined)) invalid('scoped input marker and recipe disagree')
+    if (input.snapshot) {
+      if (input.snapshot.mode !== 'scoped-overlay') invalid('invalid scoped input marker')
+      await this.validateOverlayTree(repo, input.inputTree, input.files, input.snapshot.deleted, input.reproduction.inputs)
+    }
   }
   private async recover(repo: Repo, input: InputCheckpoint, requestKey: string): Promise<FinishResult | undefined> {
     const commit = await this.ref(repo, input.outputRef)
     if (commit === undefined) return undefined
     const stored = await this.readCommit(repo, commit)
     const body = jsonCopy(stored.body) as { version?: unknown; type?: unknown; requestKey?: unknown; checkpoint?: OutputBody; prepared?: Record<string, JsonValue> } | null
-    if (body === null || typeof body !== 'object' || (body.version !== 1 && body.version !== 2) || body.type !== 'dsh-research-output'
+    if (body === null || typeof body !== 'object' || (body.version !== 1 && body.version !== 2 && body.version !== 3) || body.type !== 'dsh-research-output'
       || body.requestKey !== requestKey || !body.checkpoint || !body.prepared) invalid('output checkpoint request conflicts with immutable journal')
-    if ((body.version === 1 && body.prepared.version !== 1) || (body.version === 2 && body.prepared.version !== 3)) {
+    if ((body.version === 1 && body.prepared.version !== 1) || ((body.version === 2 || body.version === 3) && body.prepared.version !== 3)
+      || (body.version === 3) !== (input.snapshot !== undefined)) {
       invalid('output checkpoint journal version does not match its prepared result')
     }
     const cp = body.checkpoint
@@ -408,6 +500,11 @@ export class GitCheckpointProvider {
       || cp.inputRef !== input.inputRef || cp.outputRef !== input.outputRef || cp.objectFormat !== repo.format
       || cp.outputTree !== stored.tree || cp.codeChanged !== (stored.tree !== input.inputTree)
       || 'outputCommit' in cp || !isDeepStrictEqual(stored.parents, [input.inputCommit])) invalid('output checkpoint journal identity mismatch')
+    if ((cp.snapshot !== undefined) !== (input.snapshot !== undefined)
+      || (cp.snapshot && (cp.snapshot.mode !== 'scoped-overlay' || cp.snapshot.baseHead !== input.baseHead
+        || !Array.isArray(cp.snapshot.deleted) || cp.snapshot.deleted.some(file => !input.files.includes(file))
+        || new Set(cp.snapshot.deleted).size !== cp.snapshot.deleted.length))) invalid('scoped output overlay identity mismatch')
+    if (cp.snapshot) await this.validateOverlayTree(repo, cp.outputTree, input.files, cp.snapshot.deleted, input.reproduction.inputs)
     this.validatePrepared(body.prepared)
     if (!Array.isArray(cp.artifacts) || cp.artifacts.length !== (body.prepared.artifacts as string[]).length) invalid('invalid artifact journal')
     cp.artifacts.forEach((artifact, index) => {
@@ -434,7 +531,7 @@ export class GitCheckpointProvider {
       || !prepared.artifacts.every(file => typeof file === 'string')) invalid('checkpoint requires the complete prepared legacy result')
   }
 
-  async start(session: Session, researchId: string, runId: string, createdAt: string, reproduction: ReproductionSpec, signal?: AbortSignal): Promise<InputCheckpoint> {
+  async start(session: Session, researchId: string, runId: string, createdAt: string, reproduction: ReproductionSpec, signal?: AbortSignal, validate?: (checkpoint: InputCheckpoint) => void): Promise<InputCheckpoint> {
     try {
       const repo = await this.repo(session, signal)
       const inputRef = `refs/dsh/research/${researchId}/runs/${runId}/input`
@@ -443,6 +540,8 @@ export class GitCheckpointProvider {
       const outputRef = inputRef.replace(/\/input$/u, '/output')
       if (await this.ref(repo, outputRef) !== undefined) invalid('output ref already exists for new run')
       const repro = jsonCopy(reproduction)
+      const checked = reproductionSchema.safeParse(repro)
+      if (!checked.success) invalid('invalid reproduction specification: ' + checked.error.message, checked.error)
       if (typeof repro.command !== 'string' || !repro.command.trim() || !Array.isArray(repro.inputs)
         || repro.environment === null || typeof repro.environment !== 'object' || Array.isArray(repro.environment)) invalid('invalid reproduction specification')
       const cwd = relativePath(repro.cwd, true)
@@ -450,14 +549,20 @@ export class GitCheckpointProvider {
       const explicit = new Set(repro.inputs.map(safeFile))
       await this.noMerge(repo)
       const baseHead = oid(decode(await this.ok(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])).trim(), repo.format)
-      const files = [...new Set([...(await this.tracked(repo, baseHead)), ...explicit])].sort()
+      const inventory = repro.snapshot ? await this.scopedInventory(repo, baseHead, repro) : undefined
+      const files = inventory?.files ?? [...new Set([...(await this.tracked(repo, baseHead)), ...explicit])].sort()
       const captured = await this.capture(repo, files, explicit)
+      const dataStamps = await this.externalInputs(repo, repro)
+      const stamps = [...captured.stamps, ...dataStamps]
       const inputTree = await this.tree(repo, captured.entries)
-      const body: InputBody = { backend: 'git', inputRef, outputRef, inputTree, baseHead, objectFormat: repo.format, files, reproduction: repro }
-      const inputCommit = await this.commit(repo, inputTree, baseHead, message({ version: 1, type: 'dsh-research-input', checkpoint: body }), createdAt)
-      await this.verify(repo, captured.stamps)
+      const body: InputBody = { backend: 'git', inputRef, outputRef, inputTree, baseHead, objectFormat: repo.format, files, reproduction: repro,
+        ...(inventory ? { snapshot: { mode: 'scoped-overlay', deleted: captured.stamps.filter(item => item.stat === undefined).map(item => item.path), omittedChanges: inventory.omittedChanges } } : {}),
+      }
+      const inputCommit = await this.commit(repo, inputTree, baseHead, message({ version: inventory ? 2 : 1, type: 'dsh-research-input', checkpoint: body }), createdAt)
+      validate?.(jsonCopy({ ...body, inputCommit }))
+      await this.verify(repo, stamps)
       await this.noMerge(repo)
-      if (!await this.publish(repo, inputRef, inputCommit, captured.stamps)) invalid('input ref publication conflicted; start cannot be retried with this run id')
+      if (!await this.publish(repo, inputRef, inputCommit, stamps)) invalid('input ref publication conflicted; start cannot be retried with this run id')
       return { ...body, inputCommit }
     } catch (error) {
       if (error instanceof ResearcherError) throw error
@@ -514,21 +619,29 @@ export class GitCheckpointProvider {
       // remain possible after those bytes or artifact files are lost or changed.
       await beforeCapture?.()
       await this.noMerge(repo)
-      const captured = await this.capture(repo, frozenInput.files, new Set())
+      if (frozenInput.snapshot) {
+        if (original.version !== 3) invalid('scoped snapshots require a plan-bound v3 result')
+        const inventory = await this.scopedInventory(repo, frozenInput.baseHead, frozenInput.reproduction, frozenInput.files)
+        if (inventory.files.some(file => !frozenInput.files.includes(file))) invalid('new scoped source file is outside the frozen input set; declare it before execution')
+      }
+      const dataStamps = await this.externalInputs(repo, frozenInput.reproduction)
+      // Deleted explicit files may be recorded, but they may not become symlinks at finish.
+      const captured = await this.capture(repo, frozenInput.files, new Set(), new Set(frozenInput.reproduction.inputs))
       const outputTree = await this.tree(repo, captured.entries)
       const digests = await this.artifacts(repo, original.artifacts as string[])
       const body: OutputBody = {
         backend: 'git', inputCommit: frozenInput.inputCommit, inputTree: frozenInput.inputTree, outputTree,
         inputRef: frozenInput.inputRef, outputRef: frozenInput.outputRef, objectFormat: repo.format,
         artifacts: digests.artifacts, codeChanged: outputTree !== frozenInput.inputTree,
+        ...(frozenInput.snapshot ? { snapshot: { mode: 'scoped-overlay', baseHead: frozenInput.baseHead, deleted: captured.stamps.filter(item => item.stat === undefined).map(item => item.path) } } : {}),
       }
       const outputCommit = await this.commit(repo, outputTree, frozenInput.inputCommit,
-        message({ version: original.version === 3 ? 2 : 1, type: 'dsh-research-output', requestKey, prepared: original, checkpoint: body }), original.finishedAt as string)
+        message({ version: frozenInput.snapshot ? 3 : original.version === 3 ? 2 : 1, type: 'dsh-research-output', requestKey, prepared: original, checkpoint: body }), original.finishedAt as string)
       validate?.(jsonCopy({ checkpoint: { ...body, outputCommit }, prepared: original }))
-      await this.verify(repo, [...captured.stamps, ...digests.stamps])
+      await this.verify(repo, [...captured.stamps, ...digests.stamps, ...dataStamps])
       await this.noMerge(repo)
       // A failed CAS is recoverable ONLY by validating the winner's complete immutable journal.
-      await this.publish(repo, frozenInput.outputRef, outputCommit, [...captured.stamps, ...digests.stamps])
+      await this.publish(repo, frozenInput.outputRef, outputCommit, [...captured.stamps, ...digests.stamps, ...dataStamps])
       const result = await this.recover(repo, frozenInput, requestKey)
       if (result === undefined) invalid('output ref was not published')
       validate?.(result)

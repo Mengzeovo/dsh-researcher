@@ -77,7 +77,7 @@ Background survey is optional. Before every new run (including baselines/probes)
 
 ## Research view
 
-Enable `view.enabled` on the researcher plugin and install Native Archify in the same Host/client composition. The research-only **视图 / View** tab partitions actual plan directories, displays immutable revisions and exactly associated Runs, and exposes verified experiment-to-revision reasons. Viewing cold Sessions does not activate an Agent or Goal. See [configuration, APIs, and limitations](docs/research-view.md).
+Enable `view.enabled` on the researcher plugin and install Native Archify in the same Host/client composition. The research-only **视图 / View** tab partitions actual plan directories, displays every verified revision of one plan on a single pannable and zoomable canvas, wrapping every three plan/Run pairs into a new six-column row without revision pagination, and exposes exactly associated Runs and verified experiment-to-revision reasons. Per-revision Run paging and resource budgets remain in place. Viewing cold Sessions does not activate an Agent or Goal. See [configuration, APIs, and limitations](docs/research-view.md).
 
 ## Git run checkpoints
 
@@ -85,7 +85,7 @@ New runs use record v3 and require an exact selected plan plus reproduction (com
 
 The workspace must be an already committed plain local Git repository root. Checkpoints use separate immutable input/output refs under refs/dsh/research, do not modify HEAD, branches, the real index or working files, and never push. An interrupted finish reuses the exact journal stored in the output commit rather than recapturing changed files. State updates are blocked while a v2/v3 run is open; plan selection changes are blocked during any open/pending run.
 
-Tracked working files plus explicit inputs are captured; .git/.research and likely secret files are excluded/rejected. Artifact contents and external environments/data are not archived automatically. **Captured is not reproduction-verified**: restore input into a separate directory, rebuild its recorded environment and independently compare outputs. See [checkpoint protocol and limitations](docs/checkpoints.md), including custom-ref backup and transfer requirements.
+By default, tracked working files plus explicit inputs are captured. Large repositories can opt into `reproduction.snapshot: {mode: "scoped", paths: [...]}`: a bounded partial overlay on a pinned Git base, with explicit deletions and reviewed `omitChanges` for outside-scope working edits. Optional `externalInputs` retain data separately and verify exact sizes/SHA-256 at start and first finish. Existing file/byte/metadata limits are unchanged. .git/.research and likely secrets remain excluded/rejected. Artifacts and environments are not archived automatically. **Captured is not reproduction-verified**: restore input into a separate directory, rebuild its recorded environment and independently compare outputs. See [checkpoint protocol and limitations](docs/checkpoints.md), including custom-ref backup and transfer requirements.
 
 ## Reliability rules
 

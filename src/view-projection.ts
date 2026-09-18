@@ -1,4 +1,4 @@
-/** Deterministic, bounded pages over verified research records. */
+/** Continuous plan graphs with bounded Run rows over verified research records. */
 import { createHash } from 'node:crypto'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { ResearcherError } from './errors.ts'
@@ -47,7 +47,7 @@ export function projectResearchView(data: ResearchViewData, targetToken: Researc
     for (const run of runsByVersion.get(versionKey(meta.plan_id, meta.revision)) ?? []) {
       allEdges.push({ id: 'uses_' + run.run.id, kind: 'uses-plan', from: planId, to: runNodeId(run.run.id), label: '' })
     }
-    /* A revision declaring no experiment evidence is discussion/research-driven: draw one
+    /* A revision declaring no experiment evidence has no recorded experiment basis: draw one
        direct lineage edge from the previous committed revision, labeled with its authored
        change notes. Evidence-bearing revisions never carry both edge kinds, and a missing
        predecessor record cannot invent lineage. */
@@ -93,12 +93,7 @@ export function projectResearchView(data: ResearchViewData, targetToken: Researc
   const activeId = request.planId ?? selectedId ?? groups[0]?.planId ?? null
   const activeGroup = activeId === null ? undefined : groupsById.get(activeId)
   if (activeId !== null && activeGroup === undefined) throw new ResearcherError('requested plan partition does not exist', 'RESEARCH_NOT_FOUND')
-  const versionPages = Math.max(1, Math.ceil((activeGroup?.latestRevision ?? 0) / config.versionsPerPage))
-  const preferredRevision = selected?.planId === activeId ? selected.revision : activeGroup?.latestRevision ?? 1
-  const defaultPage = Math.min(versionPages - 1, Math.max(0, Math.floor((preferredRevision - 1) / config.versionsPerPage)))
-  const versionPage = request.versionPage ?? defaultPage
-  if (versionPage >= versionPages) throw new ResearcherError('requested version page does not exist', 'RESEARCH_VIEW_PAGE')
-  const pagePlans = plans.filter(record => record.document.metadata.plan_id === activeId && Math.floor((record.document.metadata.revision - 1) / config.versionsPerPage) === versionPage)
+  const activePlans = plans.filter(record => record.document.metadata.plan_id === activeId)
   const nodes: ResearchViewNode[] = []
   const details = new Map<ResearchViewNodeId, ResearchViewNodeDetail>()
   const runCounts: Record<string, number> = {}
@@ -107,15 +102,16 @@ export function projectResearchView(data: ResearchViewData, targetToken: Researc
   for (const plan of plans) {
     const meta = plan.document.metadata
     const key = versionKey(meta.plan_id, meta.revision)
-    const versionLocation = { planId: meta.plan_id, versionPage: Math.floor((meta.revision - 1) / config.versionsPerPage), runPages: {} }
+    const versionLocation = { planId: meta.plan_id, runPages: {} }
     location.set(planNodeId(meta.plan_id, meta.revision), versionLocation)
     const runs = runsByVersion.get(key) ?? []
     runs.forEach((run, index) => location.set(runNodeId(run.run.id), { ...versionLocation, runPages: { [meta.revision]: Math.floor(index / config.runsPerVersionPage) } }))
   }
-  for (const plan of pagePlans) {
+  for (const [index, plan] of activePlans.entries()) {
     const meta = plan.document.metadata
     const id = planNodeId(meta.plan_id, meta.revision)
-    const column = ((meta.revision - 1) % config.versionsPerPage) * 2
+    // Compact verified revisions, even when damaged history leaves numeric gaps.
+    const column = index * 2
     const node: ResearchViewNode = {
       id, kind: 'plan', planId: meta.plan_id, revision: meta.revision, title: meta.title, summary: viewExcerpt(meta.delta.join(' · '), 180),
       createdAt: meta.created_at, path: plan.path, column, slot: 0, sha256: plan.document.sha256,
@@ -149,11 +145,11 @@ export function projectResearchView(data: ResearchViewData, targetToken: Researc
     const nodeId = visible.has(edge.from) ? edge.to : edge.from
     outsideLinks.push({ edge, nodeId, selection: location.get(nodeId)! })
   }
-  const selection = { planId: activeId, versionPage, runPages }
-  const snapshotId = createHash('sha256').update(JSON.stringify({ format: 1, targetToken, records: data.recordVersion, selection, versionsPerPage: config.versionsPerPage, runsPerVersionPage: config.runsPerVersionPage })).digest('hex') as ResearchViewSnapshotId
+  const selection = { planId: activeId, runPages }
+  const snapshotId = createHash('sha256').update(JSON.stringify({ format: 3, targetToken, records: data.recordVersion, selection, runsPerVersionPage: config.runsPerVersionPage })).digest('hex') as ResearchViewSnapshotId
   const snapshot: ResearchViewSnapshot = {
     kind: nodes.length === 0 ? 'empty' : 'ready', snapshotId, targetToken, researchId: data.researchId, goal: data.goal, state: data.state,
-    groups, selection, pages: { versionPages, versionsPerPage: config.versionsPerPage, runsPerVersionPage: config.runsPerVersionPage, runCounts },
+    groups, selection, pages: { runsPerVersionPage: config.runsPerVersionPage, runCounts },
     nodes, edges, outsideLinks, diagnostics,
   }
   if (Buffer.byteLength(JSON.stringify(snapshot), 'utf8') > config.maxSnapshotBytes) throw new ResearcherError('research view exceeds the configured response byte limit', 'RESEARCH_OVERSIZED')

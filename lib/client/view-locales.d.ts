@@ -22,8 +22,8 @@ export declare const en: {
     revision: string;
     versions: string;
     runs: string;
+    experiment: string;
     warnings: string;
-    versionPages: string;
     runPages: string;
     page: string;
     previous: string;
@@ -50,6 +50,10 @@ export declare const en: {
     diagnostics: string;
     fit: string;
     downloadSvg: string;
+    edgeDescription: string;
+    copy: string;
+    copied: string;
+    footnotes: string;
     invalidTarget: string;
 };
 export type ResearchViewKey = keyof typeof en;
@@ -76,8 +80,8 @@ export declare const zh: {
     revision: string;
     versions: string;
     runs: string;
+    experiment: string;
     warnings: string;
-    versionPages: string;
     runPages: string;
     page: string;
     previous: string;
@@ -104,6 +108,10 @@ export declare const zh: {
     diagnostics: string;
     fit: string;
     downloadSvg: string;
+    edgeDescription: string;
+    copy: string;
+    copied: string;
+    footnotes: string;
     invalidTarget: string;
 };
 declare module '@deepseek-ai/dsh-client-ui-slots' {

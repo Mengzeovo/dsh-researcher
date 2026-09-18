@@ -36,22 +36,21 @@ describe('research view projection', () => {
     expect(project(data, viewRequest({ planId: 2 })).snapshot.nodes.map(node => node.id)).toEqual([planNodeId(2, 1)])
   }, 60000)
 
-  it('locates version and run subpages through outsideLinks without copying off-page nodes', async () => {
+  it('keeps four revisions and causal edges continuous while Run subpages remain navigable', async () => {
     const f = await populatedViewFixture(4, 1)
     const data = await f.read()
     const first = project(data).snapshot
-    const link = first.outsideLinks.find(item => item.nodeId === planNodeId(1, 4))!
-    expect(link).toMatchObject({ selection: { planId: 1, versionPage: 1 } })
-    expect(first.nodes.some(node => node.id === link.nodeId)).toBe(false)
-    const last = project(data, viewRequest({ planId: link.selection.planId!, versionPage: link.selection.versionPage, runPages: link.selection.runPages })).snapshot
-    expect(last.nodes.map(node => node.id)).toEqual([planNodeId(1, 4), runNodeId(f.runs[3]![0]!)])
-    expect(last.outsideLinks.some(item => item.nodeId === runNodeId(f.runs[2]![0]!) && item.selection.versionPage === 0)).toBe(true)
+    expect(first.nodes.filter(node => node.kind === 'plan').map(node => [node.revision, node.column])).toEqual([[1, 0], [2, 2], [3, 4], [4, 6]])
+    expect(first.nodes).toHaveLength(8)
+    expect(first.edges.filter(edge => edge.kind === 'informs-plan')).toHaveLength(3)
+    expect(first.outsideLinks).toEqual([])
+    expect(project(data, { sessionId: 'view/test' }).snapshot).toEqual(first)
 
     for (let i = 0; i < 4; i++) await f.addRun(1, 1)
     const expanded = await f.read()
     const runPage = project(expanded, viewRequest({ runPages: { 1: 1 } })).snapshot
     const hiddenBasis = runPage.outsideLinks.find(item => item.nodeId === runNodeId(f.runs[0]![0]!))!
-    expect(hiddenBasis.selection).toMatchObject({ planId: 1, versionPage: 0, runPages: { 1: 0 } })
+    expect(hiddenBasis.selection).toMatchObject({ planId: 1, runPages: { 1: 0 } })
     expect(runPage.nodes.filter(node => node.kind === 'run' && node.revision === 1)).toHaveLength(1)
     expect(runPage.nodes.some(node => node.id === hiddenBasis.nodeId)).toBe(false)
     const restored = project(expanded, viewRequest({ ...hiddenBasis.selection, planId: hiddenBasis.selection.planId! })).snapshot
@@ -85,19 +84,15 @@ describe('research view projection', () => {
     expect(bad.diagnostics).toContainEqual(expect.objectContaining({ code: 'RUN_PLAN_INTEGRITY' }))
   }, 30000)
 
-  it('carries cross-page revision lineage as navigable outside links', async () => {
+  it('keeps all discussion-driven lineage edges in the graph, even across the former page boundary', async () => {
     const f = await populatedViewFixture(4, 1, false)
     const data = await f.read()
-    const first = project(data).snapshot
-    expect(first.edges.filter(edge => edge.kind === 'revises-plan').map(edge => edge.id)).toEqual(['revises_1_v2', 'revises_1_v3'])
-    const forward = first.outsideLinks.find(item => item.edge.kind === 'revises-plan')!
-    expect(forward.nodeId).toBe(planNodeId(1, 4))
-    expect(forward.selection).toMatchObject({ planId: 1, versionPage: 1 })
-    const last = project(data, viewRequest({ planId: 1, versionPage: 1 })).snapshot
-    expect(last.edges.filter(edge => edge.kind === 'revises-plan')).toHaveLength(0)
-    expect(last.outsideLinks.some(item => item.edge.kind === 'revises-plan'
-      && item.edge.to === planNodeId(1, 4)
-      && item.nodeId === planNodeId(1, 3) && item.selection.versionPage === 0)).toBe(true)
+    const snapshot = project(data).snapshot
+    expect(snapshot.edges.filter(edge => edge.kind === 'revises-plan').map(edge => edge.id)).toEqual(['revises_1_v2', 'revises_1_v3', 'revises_1_v4'])
+    expect(snapshot.outsideLinks).toEqual([])
+    const sparse = project({ ...data, plans: data.plans.filter(plan => plan.document.metadata.revision !== 2) }).snapshot
+    expect(sparse.nodes.filter(node => node.kind === 'plan').map(node => [node.revision, node.column])).toEqual([[1, 0], [3, 2], [4, 4]])
+    expect(sparse.edges.filter(edge => edge.kind === 'revises-plan').map(edge => edge.id)).toEqual(['revises_1_v4'])
   }, 60000)
 
   it('does not create partitions from missing plan references in valid Run records', async () => {
@@ -174,7 +169,6 @@ describe('research view projection', () => {
     expect(() => project(changedData, viewRequest(), { ...viewConfig, maxSnapshotBytes: bytes - 1 })).toThrow(expect.objectContaining({ code: 'RESEARCH_OVERSIZED' }))
     expect(() => project(changedData, viewRequest(), { ...viewConfig, maxSnapshotBytes: 1 })).toThrow(expect.objectContaining({ code: 'RESEARCH_OVERSIZED' }))
     expect(() => project(changedData, viewRequest({ planId: 99 }))).toThrow(expect.objectContaining({ code: 'RESEARCH_NOT_FOUND' }))
-    expect(() => project(changedData, viewRequest({ versionPage: 1 }))).toThrow(expect.objectContaining({ code: 'RESEARCH_VIEW_PAGE' }))
     expect(() => project(changedData, viewRequest({ runPages: { 1: 1 } }))).toThrow(expect.objectContaining({ code: 'RESEARCH_VIEW_PAGE' }))
   }, 30000)
 })

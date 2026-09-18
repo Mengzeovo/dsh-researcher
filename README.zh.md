@@ -77,7 +77,7 @@ Web GUI 中输入裸 `/research-load` 会打开目标选择器。损坏目标仍
 
 ## 研究视图
 
-在同一 Host/client 组合中安装 Native Archify，并给 researcher 设置 `view: { enabled: true, presetIds: [research] }`，即可为研究模式注册“视图”页签；默认关闭，保留原有无界面与目标选择器用法。每个真实方案目录对应一个分区，版本与 Run 以精确引用连接，只有显式且摘要验证通过的实验依据生成修订因果边。冷会话查看不激活 Agent 或 Goal；主动选择加载目标仍遵循原命令规则。
+在同一 Host/client 组合中安装 Native Archify，并给 researcher 设置 `view: { enabled: true, presetIds: [research] }`，即可为研究模式注册“视图”页签；默认关闭，保留原有无界面与目标选择器用法。每个真实方案目录对应一个分区，同一方案的全部已验证版本在一张可平移、缩放的画布中连续展示，每行最多6列（3组版本＋实验），超出后向下换行，不再按版本分页；每个版本的 Run 分页与资源预算仍保留。版本与 Run 以精确引用连接，只有显式且摘要验证通过的实验依据生成修订因果边。冷会话查看不激活 Agent 或 Goal；主动选择加载目标仍遵循原命令规则。
 
 新方案元数据使用 v2，可提交 `based_on_runs: [{run_id, reason}]`；Host 记录已封存 Run 的实际字节摘要，要求同目标、同方案、较早版本及已发布状态转换。初版不得带实验依据，后续版本不自动继承，旧 v1 文档不改写。
 
@@ -87,8 +87,9 @@ Web GUI 中输入裸 `/research-load` 会打开目标选择器。损坏目标仍
 
 新 run 使用 v3 记录，start 必须提供精确选中的方案版本及 reproduction（command、cwd、environment、inputs）。在实际执行前自动保存输入代码，finish 保存输出代码和产物 SHA-256，再提交不可变结果与 state。旧 v1/v2 run 仍可读取/关闭，不补造历史代码快照或方案来源。
 
-- workspace 必须是 POSIX 系统中已有提交的普通本地 Git 仓库根目录；不自动 git init；第一版不支持 Windows、linked worktree、submodule、符号链接源码等特殊布局。
-- tracked 工作文件（含未提交修改）和显式输入被捕获；不改 HEAD、分支、真实 index 或工作文件，不自动 push。
+- workspace 必须是 POSIX 系统中已有提交的普通本地 Git 仓库根目录；不自动 git init；不支持 Windows、linked worktree、submodule 等布局；受限支持已跟踪的仓库内相对叶子符号链接，仅保存链接文本，不跟随目标。
+- 默认捕获 tracked 工作文件（含未提交修改）和显式输入；大仓库可显式使用 `reproduction.snapshot: {mode: "scoped", paths: [...]}`，只捕获指定范围并固定 Git 基准，记录删除清单。范围外工作区修改必须通过 `omitChanges` 逐项确认，不静默跳过。容量上限不变；不改 HEAD、分支、真实 index 或工作文件，不自动 push。
+- scoped 模式的 `externalInputs` 只记录保留数据的路径、长度及 SHA-256，并在 start/首次 finish 校验，不纳入代码树。恢复必须先恢复基准，再覆盖部分树并应用删除；不能把部分树当完整仓库直接 checkout。
 - 每个 run 分别固定 input/output 两个 refs/dsh/research/... 引用。输出 commit 内保存精确 finish 日志，崩溃后同 payload 重试不会重新捕获已变化的文件。
 - .git/.research、疑似密钥文件不纳入；未跟踪/ignored 文件须显式声明。产物只保存摘要，外部数据和环境须另行保留。
 - v2/v3 run 打开期间不允许普通 state 更新；任何 open/pending run 期间都不允许切换选中方案。停止写入代码/产物后再 finish；源代码中途变化和外部依赖仍可能影响复现。

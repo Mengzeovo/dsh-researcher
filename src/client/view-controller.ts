@@ -36,7 +36,7 @@ const initial: ResearchViewClientState = {
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error)
 /** Stable key for server-owned pagination; camera identity excludes snapshot revisions. */
 export function viewPageKey(selection: ResearchViewSelection): string {
-  return JSON.stringify([selection.planId, selection.versionPage,
+  return JSON.stringify([selection.planId,
     Object.entries(selection.runPages).sort(([a], [b]) => a.localeCompare(b))])
 }
 
@@ -190,7 +190,7 @@ export class ResearchViewController {
       const samePage = previous !== null && viewPageKey(previous.selection) === viewPageKey(selection)
       const response = await this.api.getView({ sessionId: this.sessionId,
         ...(selection.planId === null ? {} : { planId: selection.planId,
-          versionPage: selection.versionPage, runPages: selection.runPages }),
+          runPages: selection.runPages }),
         ...(samePage ? { ifNoneMatch: previous.snapshotId } : {}), refresh: force }, abort.signal)
       if (!current()) return
       if (response.kind === 'unbound') {

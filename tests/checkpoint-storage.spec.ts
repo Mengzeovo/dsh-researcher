@@ -73,7 +73,7 @@ describe('ResearchStore checkpoint integration', () => {
     expect(started.planRef).toEqual(baseState.selectedPlanRef)
     expect(open.result).toBeUndefined()
     expect(checkpoints.start).toHaveBeenCalledExactlyOnceWith(
-      session, target.id, started.runId, open.description.createdAt, reproduction, signal,
+      session, target.id, started.runId, open.description.createdAt, reproduction, signal, expect.any(Function),
     )
     const input = await checkpoints.start.mock.results[0]!.value
     expect(started.checkpoint).toEqual(input)

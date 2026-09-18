@@ -25,6 +25,11 @@ const CHECKPOINT_OUTPUT = {
     output_ref: { type: 'string', required: true },
     code_changed: { type: 'boolean' },
     verification: { type: 'string', required: true },
+    snapshot_mode: { type: 'string', enum: ['scoped-overlay'] },
+    base_commit: { type: 'string' },
+    captured_files: { type: 'integer' },
+    deleted_files: { type: 'array', items: { type: 'string' } },
+    omitted_changes: { type: 'array', items: { type: 'string' } },
   },
 } as const
 
@@ -444,7 +449,7 @@ export function apply(ctx: Context): void {
       + 'Every new run, including a baseline or probe, requires an explicitly saved and selected plan revision; pass that exact plan. Pure reading/searching does not become a run. '
       + 'Only active research targets can start a run. Loading paused/blocked targets does not resume them; obtain explicit authorization to resume state, or use start_research for explicitly requested continuous work. '
       + 'Freeze Git input code with a reproduction recipe before execution. Requires a committed plain Git repository at the workspace root. '
-      + 'Tracked working files and explicit reproduction.inputs are captured; never include secrets. environment is descriptive, not injected. '
+      + 'By default capture tracked working files plus explicit reproduction.inputs. For large repositories opt into reproduction.snapshot scoped paths: a partial overlay on a pinned Git base, not a full working-tree snapshot. External inputs are retained separately and verified by size/SHA-256. Never include secrets. environment is descriptive, not injected. '
       + 'Finish any open run first. This tool does not execute the recipe; do not edit source during execution or claim snapshot capture proves reproducibility.',
     parameters: {
       purpose: { type: 'string', required: true },
@@ -456,7 +461,24 @@ export function apply(ctx: Context): void {
           command: { type: 'string', required: true, description: 'Exact shell command/script including build and run steps, with no literal secrets.' },
           cwd: { type: 'string', required: true, description: 'Project-relative command directory, or dot for the root.' },
           environment: { type: 'object', required: true, additionalProperties: true, description: 'Non-secret environment/dependency/data versions, container digest and determinism constraints; descriptive only.' },
-          inputs: { type: 'array', required: true, items: { type: 'string' }, description: 'Explicit extra regular input/code files including needed untracked/ignored files. Tracked working files are captured automatically. No directories.' },
+          inputs: { type: 'array', required: true, items: { type: 'string' }, description: 'Explicit extra regular input/code files, including all needed untracked/ignored files. Tracked capture follows snapshot scope when supplied. No directories or symlinks.' },
+          snapshot: {
+            type: 'object', additionalProperties: false,
+            description: 'Opt-in bounded partial overlay. Preserve the pinned Git base, restore it before applying captured paths and deletions. Omitted tracked changes are reported but NOT captured. Caller must declare complete build/runtime dependency inputs.',
+            properties: {
+              mode: { type: 'string', required: true, enum: ['scoped'] },
+              paths: { type: 'array', required: true, items: { type: 'string' }, description: 'Nonempty canonical project-relative exact files or directory prefixes; no globs, dot root, metadata, or implicit untracked discovery.' },
+              omitChanges: { type: 'array', items: { type: 'string' }, description: 'Exact reviewed list of tracked changes outside capture scope. Omit when none; any unacknowledged outside change is an error. These changes are NOT captured.' },
+              externalInputs: {
+                type: 'array', description: 'Retained regular data files, not archived as code blobs. Checked at start and first finish; aggregate at most 1 GiB. Cannot also be in inputs.',
+                items: { type: 'object', additionalProperties: false, properties: {
+                  path: { type: 'string', required: true },
+                  bytes: { type: 'integer', required: true },
+                  sha256: { type: 'string', required: true },
+                } },
+              },
+            },
+          },
         },
       },
     },
@@ -485,7 +507,12 @@ export function apply(ctx: Context): void {
         input_commit: result.checkpoint.inputCommit,
         input_ref: result.checkpoint.inputRef,
         output_ref: result.checkpoint.outputRef,
-        verification: 'snapshot-only; execute and independently compare results to verify reproducibility',
+        verification: result.checkpoint.snapshot
+          ? 'scoped-overlay only; restore pinned base then overlay/deletions; retain external data; dependency completeness and reproduction unverified'
+          : 'snapshot-only; execute and independently compare results to verify reproducibility',
+        ...(result.checkpoint.snapshot ? { snapshot_mode: result.checkpoint.snapshot.mode, base_commit: result.checkpoint.baseHead,
+          captured_files: result.checkpoint.files.length, deleted_files: [...result.checkpoint.snapshot.deleted],
+          omitted_changes: [...result.checkpoint.snapshot.omittedChanges] } : {}),
       } }
     },
     presentCall: args => present('Start research run', 'other', args.purpose),
@@ -547,7 +574,11 @@ export function apply(ctx: Context): void {
           input_commit: result.checkpoint.inputCommit, input_ref: result.checkpoint.inputRef,
           output_commit: result.checkpoint.outputCommit, output_ref: result.checkpoint.outputRef,
           code_changed: result.checkpoint.codeChanged,
-          verification: 'snapshot-only; no independent reproduction was performed',
+          verification: result.checkpoint.snapshot
+            ? 'scoped-overlay only; code_changed describes captured paths, not the full repository; no independent reproduction performed'
+            : 'snapshot-only; no independent reproduction was performed',
+          ...(result.checkpoint.snapshot ? { snapshot_mode: result.checkpoint.snapshot.mode, base_commit: result.checkpoint.snapshot.baseHead,
+            deleted_files: [...result.checkpoint.snapshot.deleted] } : {}),
         } }),
         research_state: stateValue(result.state),
         path: result.path,

@@ -1,7 +1,7 @@
 /** Props-only research browser. The Native plugin owns the sole diagram iframe. */
-import { useEffect } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
-import { Button, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, MarkdownText, Modal, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ResearchViewNode } from '../view-types.ts'
 import type { ResearchViewProps } from './view-contract.ts'
 import { viewPageKey } from './view-controller.ts'
@@ -48,6 +48,10 @@ export function ResearchView(props: ResearchViewProps) {
   const selection = props.useStore(value => value.selection)
   const selectedId = props.useStore(value => value.selectedNodeId)
   const snapshot = state.snapshot
+  const [edgeSelection, setEdgeSelection] = useState<{ snapshotId: string; id: string } | null>(null)
+  const descriptionRef = useRef<HTMLDivElement>(null)
+  const markdownLabels = useMemo(() => ({ code: { copyLabel: t('copy'), copiedLabel: t('copied') }, footnotes: t('footnotes') }), [t, locale])
+  const nodeTitle = (node: ResearchViewNode) => node.kind === 'run' ? t('experiment', { name: node.title }) : node.title
   const pageKey = viewPageKey(snapshot?.selection ?? selection)
   const camera = props.useStore(value => value.cameras[pageKey] ?? null)
   useEffect(() => { void enter(selection, { theme, locale }); return leave }, [enter, leave])
@@ -59,13 +63,22 @@ export function ResearchView(props: ResearchViewProps) {
     if (node !== undefined) actions.selectNode(node.id)
     props.completeViewRequest()
   }, [props.viewRequest, props.completeViewRequest, snapshot, state.phase, actions])
+  useEffect(() => { setEdgeSelection(null) }, [snapshot?.snapshotId, pageKey])
   const selected = snapshot?.nodes.find(node => node.id === selectedId)
+  const selectedEdge = edgeSelection?.snapshotId === snapshot?.snapshotId
+    ? snapshot?.edges.find(edge => edge.id === edgeSelection?.id && edge.label.trim() !== '') : undefined
+  const chooseEdge = (id: string) => {
+    const edge = snapshot?.edges.find(item => item.id === id && item.label.trim() !== '')
+    if (snapshot !== null && edge !== undefined) setEdgeSelection({ snapshotId: snapshot.snapshotId, id: edge.id })
+  }
   const chooseNode = (id: string) => {
     const node = snapshot?.nodes.find(item => item.id === id)
-    if (node !== undefined) actions.selectNode(node.id)
+    if (node !== undefined) { setEdgeSelection(null); actions.selectNode(node.id) }
   }
   const artifact = state.artifactAppearance?.theme === theme && state.artifactAppearance.locale === locale
     ? state.artifact : null
+  // Move keyboard focus out of the sandboxed iframe so Escape reaches the dialog.
+  useEffect(() => { if (selectedEdge !== undefined) descriptionRef.current?.focus() }, [selectedEdge, artifact])
   const live = state.watchError === null
   return <section aria-label={t('title')} style={{ display: 'flex', flexDirection: 'column',
     height: '100%', minHeight: 0, color: 'var(--dsw-alias-label-primary)' }}>
@@ -118,8 +131,6 @@ export function ResearchView(props: ResearchViewProps) {
             {t('plan', { id: group.planId }) + ' · ' + group.title}
           </option>)}
         </select>
-        <Pager t={t} page={snapshot.selection.versionPage} count={snapshot.pages.versionPages}
-          title={t('versionPages')} onPage={versionPage => actions.selectPage({ ...snapshot.selection, versionPage, runPages: {} })} />
         {snapshot.nodes.filter(node => node.kind === 'plan').map(node => {
           const count = Math.max(1, Math.ceil((snapshot.pages.runCounts[String(node.revision)] ?? 0) / snapshot.pages.runsPerVersionPage))
           if (count <= 1) return null
@@ -136,9 +147,10 @@ export function ResearchView(props: ResearchViewProps) {
         display: 'flex', flexDirection: 'column' }}>
         {state.rendering && <p role="status" style={panel}>{t('rendering')}</p>}
         {snapshot.nodes.length === 0 && <p style={panel}>{t('empty')}</p>}
-        {artifact !== null && <div style={{ flex: 1, minHeight: 360 }}>
+        {artifact !== null && <div style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
           {renderSlot('research.view.diagram', {
-            artifact,
+            artifact: { ...artifact, edgeIds: snapshot.edges.filter(edge => edge.label.trim() !== '').map(edge => edge.id) },
+            onEdgeSelect: chooseEdge,
             theme, locale, selectedNodeId: selected?.id ?? null, onNodeSelect: chooseNode,
             camera, onCameraChange: next => actions.setCamera(pageKey, next),
             labels: { title: t('diagram'), fit: t('fit'), downloadSvg: t('downloadSvg'), unavailable: t('unavailable') },
@@ -146,23 +158,23 @@ export function ResearchView(props: ResearchViewProps) {
         </div>}
         {selected === undefined && artifact !== null && <span style={{ ...muted, position: 'absolute',
           left: 12, bottom: 10, pointerEvents: 'none' }}>{t('chooseNode')}</span>}
-        {selected !== undefined && <div role="dialog" aria-label={selected.title} style={{ ...card,
+        {selected !== undefined && <div role="dialog" aria-label={nodeTitle(selected)} style={{ ...card,
           position: 'absolute', top: 12, right: 12, width: 340, maxWidth: 'calc(100% - 24px)',
           maxHeight: 'calc(100% - 24px)', overflow: 'auto', zIndex: 10, fontSize: 13 }}>
           <Button variant="ghost" size="sm" aria-label={t('close')}
             style={{ position: 'absolute', top: 6, right: 6 }}
             onClick={() => actions.selectNode(null)}>×</Button>
-          <h4 style={{ margin: '0 0 8px', paddingRight: 20, lineHeight: 1.4 }}>{selected.title}</h4>
+          <h4 style={{ margin: '0 0 8px', paddingRight: 20, lineHeight: 1.4, overflowWrap: 'anywhere' }}>{nodeTitle(selected)}</h4>
           <NodeFacts node={selected} t={t} />
           <p style={{ ...muted, overflowWrap: 'anywhere', lineHeight: 1.55, margin: '8px 0 10px' }}>{selected.summary}</p>
           <dl style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 12px', margin: '0 0 10px' }}>
             <dt style={muted}>{t('createdAt')}</dt><dd style={{ ...code, margin: 0 }}>{selected.createdAt}</dd>
-            <dt style={muted}>{t('path')}</dt><dd style={{ ...code, margin: 0 }}>{selected.path}</dd>
+            {selected.kind === 'plan' && <><dt style={muted}>{t('path')}</dt><dd style={{ ...code, margin: 0 }}>{selected.path}</dd></>}
             {selected.kind === 'plan' && <><dt style={muted}>{t('hash')}</dt><dd style={{ ...code, margin: 0 }}>{selected.sha256}</dd></>}
           </dl>
           {selected.kind === 'run' && <><h4>{t('metrics')}</h4><pre style={code}>{JSON.stringify(selected.metrics, null, 2)}</pre></>}
           {state.detailLoading && <p role="status">{t('loading')}</p>}
-          {state.detail !== null && state.detail.node.id === selected.id && <details open>
+          {state.detail !== null && state.detail.node.id === selected.id && <details>
             <summary>{t('record')}</summary>
             <pre style={code}>{state.detail.kind === 'plan' ? state.detail.document.body : JSON.stringify(state.detail.record, null, 2)}</pre>
           </details>}
@@ -171,9 +183,14 @@ export function ResearchView(props: ResearchViewProps) {
               {snapshot.edges.filter(edge => edge.from === selected.id || edge.to === selected.id).map(edge => {
                 const other = edge.from === selected.id ? edge.to : edge.from
                 const node = snapshot.nodes.find(item => item.id === other)
-                return node === undefined ? null : <Button key={edge.id} variant="ghost" onClick={() => chooseNode(node.id)}>
-                  {t(edgeKindKey[edge.kind]) + ': ' + node.title}
-                </Button>
+                return node === undefined ? null : <div key={edge.id} style={stack}>
+                  <Button variant="ghost" onClick={() => chooseNode(node.id)}>
+                    {t(edgeKindKey[edge.kind]) + ': ' + nodeTitle(node)}
+                  </Button>
+                  {edge.label.trim() !== '' && <Button variant="outline" size="sm" onClick={() => chooseEdge(edge.id)}>
+                    {t('edgeDescription')}
+                  </Button>}
+                </div>
               })}
               {snapshot.outsideLinks.map(link => <Button key={link.edge.id} variant="outline"
                 onClick={() => actions.selectPage(link.selection, link.nodeId)}>
@@ -189,5 +206,20 @@ export function ResearchView(props: ResearchViewProps) {
         </details>}
       </main>
     </div>}
+    <Modal open={selectedEdge !== undefined && state.phase === 'ready' && artifact !== null}
+      title={t('edgeDescription')} closeLabel={t('close')} onClose={() => setEdgeSelection(null)}>
+      {selectedEdge !== undefined && <div ref={descriptionRef} tabIndex={-1} style={{ outline: 'none' }}>
+        <p style={{ ...muted, overflowWrap: 'anywhere' }}>{t(edgeKindKey[selectedEdge.kind])}</p>
+        <p style={{ fontSize: 13, overflowWrap: 'anywhere' }}>
+          {[selectedEdge.from, selectedEdge.to].map(id => {
+            const node = snapshot?.nodes.find(item => item.id === id)
+            return node === undefined ? '' : node.kind === 'plan' ? t('revision', { revision: node.revision }) + ' · ' + node.title : nodeTitle(node)
+          }).join(' → ')}
+        </p>
+        <div style={{ maxHeight: '60vh', overflow: 'auto', overflowWrap: 'anywhere' }}>
+          <MarkdownText text={selectedEdge.label} labels={markdownLabels} />
+        </div>
+      </div>}
+    </Modal>
   </section>
 }

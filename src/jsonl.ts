@@ -123,6 +123,9 @@ export function parseRunLog(runId: RunId, text: string): ResearchRun {
     const after = closed.checkpoint
     const width = after.objectFormat === 'sha1' ? 40 : 64
     if ([after.inputCommit, after.outputCommit, after.inputTree, after.outputTree].some(oid => oid.length !== width)) invalidRecord('checkpoint object format mismatch')
+    if ((before.snapshot !== undefined) !== (after.snapshot !== undefined)
+      || (after.snapshot && (after.snapshot.baseHead !== before.baseHead || after.snapshot.baseHead.length !== width
+        || after.snapshot.deleted.some(file => !before.files.includes(file))))) invalidRecord('scoped checkpoint overlay identity disagrees with its description')
     if (closed.transition.revision !== desc.baseStateRevision + 1
       || closed.transition.lastRunId !== runId
       || before.inputCommit !== after.inputCommit || before.inputTree !== after.inputTree

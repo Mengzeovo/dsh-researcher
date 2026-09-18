@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { createElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import type { ArchifyViewerProps } from 'dsh-archify-native/types'
 import { ResearchView } from '../src/client/ResearchView.tsx'
 import { createResearchViewStore } from '../src/client/view-store.ts'
@@ -26,11 +26,11 @@ const snapshot: ResearchViewSnapshot = {
   state: { version: 1, revision: 1, at: '', sessionId: 'session', status: 'active', summary: 'Ready' },
   groups: [{ planId: 1, title: 'Measure throughput', latestRevision: 7, revisionCount: 7, runCount: 5, warningCount: 0 },
     { planId: 2, title: 'Compare latency', latestRevision: 1, revisionCount: 1, runCount: 0, warningCount: 0 }],
-  selection: { planId: 1, versionPage: 0, runPages: { '1': 0 } },
-  pages: { versionPages: 3, versionsPerPage: 3, runsPerVersionPage: 4, runCounts: { '1': 5 } },
+  selection: { planId: 1, runPages: { '1': 0 } },
+  pages: { runsPerVersionPage: 4, runCounts: { '1': 5 } },
   nodes: [plan, run], edges: [{ id: 'uses', kind: 'uses-plan', from: run.id, to: plan.id, label: '' }],
   outsideLinks: [{ edge: { id: 'outside', kind: 'informs-plan', from: run.id, to: 'plan:2:1' as ResearchViewNodeId, label: '' },
-    nodeId: 'plan:2:1' as ResearchViewNodeId, selection: { planId: 2, versionPage: 0, runPages: {} } }], diagnostics: [],
+    nodeId: 'plan:2:1' as ResearchViewNodeId, selection: { planId: 2, runPages: {} } }], diagnostics: [],
 }
 function bench(ready = true) {
   const controller = new ResearchViewController('unused', {} as never, () => {})
@@ -70,6 +70,14 @@ function bench(ready = true) {
 }
 
 describe('Research View presentation', () => {
+  it('allows the Native graph slot to shrink below 360px without overflowing the page', () => {
+    bench()
+    const viewport = screen.getByTestId('native-viewer').parentElement!
+    expect(viewport.style.minHeight).toBe('0')
+    expect(viewport.style.minWidth).toBe('0')
+    expect(viewport.style.flexGrow).toBe('1')
+    expect(viewport.style.overflow).toBe('hidden')
+  })
   it('uses the existing research-load action in its unbound empty state', () => {
     const b = bench(false)
     expect(screen.getByText(en.unbound)).toBeTruthy()
@@ -98,9 +106,8 @@ describe('Research View presentation', () => {
     fireEvent.change(screen.getByRole('combobox', { name: en.planSelect }), { target: { value: '2' } })
     expect(b.store.store.getSnapshot().selection.planId).toBe(2)
     fireEvent.change(screen.getByRole('combobox', { name: en.planSelect }), { target: { value: '1' } })
-    fireEvent.click(within(screen.getByRole('navigation', { name: en.versionPages })).getByRole('button', { name: /Next page/ }))
-    expect(b.store.store.getSnapshot().selection.versionPage).toBe(1)
-    fireEvent.click(within(screen.getByRole('navigation', { name: 'Runs for version 1' })).getByRole('button', { name: /Next page/ }))
+    expect(screen.queryByRole('navigation', { name: 'Version pages' })).toBeNull()
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Experiments for version 1' })).getByRole('button', { name: /Next page/ }))
     expect(b.store.store.getSnapshot().selection.runPages['1']).toBe(1)
     b.store.actions.selectNode(run.id)
     b.refresh()
@@ -148,6 +155,58 @@ describe('Research View presentation', () => {
     expect(b.load).toHaveBeenLastCalledWith(snapshot.selection, { theme: 'light', locale: 'en' }, true)
     fireEvent.click(screen.getByRole('button', { name: en.refresh }))
     expect(b.load).toHaveBeenLastCalledWith(snapshot.selection, { theme: 'light', locale: 'en' }, true)
+  })
+  it('shows the authored experiment name instead of a Run id', () => {
+    const b = bench()
+    b.store.actions.selectNode(run.id)
+    b.refresh()
+    expect(screen.getByRole('dialog', { name: 'Experiment First probe' })).toBeTruthy()
+    expect(screen.queryByText(run.runId)).toBeNull()
+    expect(screen.queryByText(en.path)).toBeNull()
+    b.language('zh')
+    b.refresh({ artifactAppearance: { theme: 'light', locale: 'zh-CN' } })
+    expect(screen.getByRole('dialog', { name: '实验 First probe' })).toBeTruthy()
+  })
+  it.each(['informs-plan', 'revises-plan'] as const)('renders the full %s arrow description as safe Markdown, and closes on Escape', kind => {
+    const b = bench()
+    const label = '# Evidence\n\n**Complete finding** after the abbreviated preview.\n\n- First observation\n- Final observation\n\n<img src=x onerror=alert(1)>\n\n[Unsafe](javascript:alert(1))'
+    const edge = { id: 'explanation', kind, from: run.id, to: plan.id, label }
+    b.refresh({ snapshot: { ...snapshot, edges: [...snapshot.edges, edge] } })
+    expect(b.native.at(-1)?.artifact.edgeIds).toEqual(['explanation'])
+    act(() => b.native.at(-1)?.onEdgeSelect?.('unknown'))
+    act(() => b.native.at(-1)?.onEdgeSelect?.('uses'))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    act(() => b.native.at(-1)?.onEdgeSelect?.(edge.id))
+    const dialog = screen.getByRole('dialog', { name: en.edgeDescription })
+    expect(dialog.contains(document.activeElement)).toBe(true)
+    expect(within(dialog).getByRole('heading', { name: 'Evidence' })).toBeTruthy()
+    expect(within(dialog).getByText('Complete finding').tagName).toBe('STRONG')
+    expect(within(dialog).getAllByRole('listitem')).toHaveLength(2)
+    expect(dialog.textContent).toContain('Final observation')
+    expect(dialog.querySelector('img, script, a[href^="javascript:"]')).toBeNull()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog', { name: en.edgeDescription })).toBeNull()
+    act(() => b.native.at(-1)?.onEdgeSelect?.(edge.id))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: en.close }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+  it('clears the arrow description on graph replacement and offers it from node relations', () => {
+    const b = bench()
+    const edge = { id: 'explanation', kind: 'informs-plan' as const, from: run.id, to: plan.id, label: '**Full reason**' }
+    const graph = { ...snapshot, edges: [...snapshot.edges, edge] }
+    b.refresh({ snapshot: graph })
+    b.store.actions.selectNode(run.id)
+    b.refresh()
+    fireEvent.click(screen.getByRole('button', { name: en.edgeDescription }))
+    expect(screen.getByRole('dialog', { name: en.edgeDescription })).toBeTruthy()
+    b.refresh({ snapshot: { ...graph, snapshotId: 'new-graph' as ResearchViewSnapshotId } })
+    expect(screen.queryByRole('dialog', { name: en.edgeDescription })).toBeNull()
+    b.language('zh')
+    b.refresh({ artifactAppearance: { theme: 'light', locale: 'zh-CN' } })
+    act(() => b.native.at(-1)?.onEdgeSelect?.(edge.id))
+    expect(screen.getByRole('dialog', { name: zh.edgeDescription })).toBeTruthy()
+    act(() => b.native.at(-1)?.onNodeSelect?.(plan.id))
+    expect(screen.queryByRole('dialog', { name: zh.edgeDescription })).toBeNull()
   })
   it('shows request errors as text without executing their markup', () => {
     const b = bench(false)

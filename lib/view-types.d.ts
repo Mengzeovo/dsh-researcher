@@ -10,7 +10,6 @@ export type ResearchViewArtifactId = Branded<'ResearchViewArtifactId'>;
 export interface ResearchViewConfig {
     readonly enabled: boolean;
     readonly presetIds: readonly string[];
-    readonly versionsPerPage: number;
     readonly runsPerVersionPage: number;
     readonly maxRecords: number;
     readonly maxDataBytes: number;
@@ -59,12 +58,9 @@ export interface ResearchViewPlanGroup {
 }
 export interface ResearchViewSelection {
     readonly planId: number | null;
-    readonly versionPage: number;
     readonly runPages: Readonly<Record<string, number>>;
 }
 export interface ResearchViewPageInfo {
-    readonly versionPages: number;
-    readonly versionsPerPage: number;
     readonly runsPerVersionPage: number;
     readonly runCounts: Readonly<Record<string, number>>;
 }
@@ -76,6 +72,7 @@ interface ResearchViewNodeBase {
     readonly summary: string;
     readonly path: string;
     readonly createdAt: string;
+    /** Logical column in revision order; the workflow presentation wraps every six columns. */
     readonly column: number;
     readonly slot: number;
 }
@@ -122,7 +119,6 @@ export interface ResearchViewSnapshot {
 export interface ResearchViewRequest {
     readonly sessionId: string;
     readonly planId?: number | undefined;
-    readonly versionPage?: number | undefined;
     readonly runPages?: Readonly<Record<string, number>> | undefined;
     readonly ifNoneMatch?: ResearchViewSnapshotId | undefined;
     readonly refresh?: boolean | undefined;

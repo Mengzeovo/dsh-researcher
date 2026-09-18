@@ -66,7 +66,9 @@ function renderRun(run: ResearchRun | undefined): string {
       `Input checkpoint: ${run.description.checkpoint.inputCommit}`,
       `Input ref: ${run.description.checkpoint.inputRef}`,
       `Reproduction recipe: ${JSON.stringify(run.description.checkpoint.reproduction)}`,
-      'Checkpoint scope: tracked working files plus explicit inputs, no environment/data archive; reproduction not verified.',
+      run.description.checkpoint.snapshot
+        ? `Checkpoint scope: scoped-overlay on base ${run.description.checkpoint.baseHead}; ${run.description.checkpoint.files.length} frozen paths, ${run.description.checkpoint.snapshot.deleted.length} deletions, ${run.description.checkpoint.snapshot.omittedChanges.length} omitted tracked changes. Restore base then overlay/delete; external data retained separately; dependencies/reproduction not verified.`
+        : 'Checkpoint scope: tracked working files plus explicit inputs, no environment/data archive; reproduction not verified.',
     ] : ['Legacy run: no code checkpoint was captured.']),
     ...(run.result === undefined
       ? ['Status: open']

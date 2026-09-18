@@ -47,7 +47,11 @@ describe('Root researcher public view configuration', () => {
       expect(researchViewClientConfigSchema.safeParse(invalid).success).toBe(false)
     }
     expect(resolveResearcherConfig({}).view.enabled).toBe(false)
-    expect(() => resolveResearcherConfig({ view: { versionsPerPage: 0 } })).toThrow()
+    expect(resolveResearcherConfig({}).view).not.toHaveProperty('versionsPerPage')
+    for (const versionsPerPage of [0, 1, 3, 100]) {
+      expect(() => resolveResearcherConfig({ view: { versionsPerPage } })).toThrow()
+    }
+    expect(() => resolveResearcherConfig({ view: { runsPerVersionPage: 5 } })).toThrow()
   })
 
   it('shares the strict direct Root endpoint between both faces and lists it in the public catalog', () => {

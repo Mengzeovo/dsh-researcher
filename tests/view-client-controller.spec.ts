@@ -6,7 +6,7 @@ import type { ResearchViewChanged, ResearchViewArtifactId, ResearchPlanViewNode,
   ResearchViewResponse, ResearchViewSelection, ResearchViewSnapshot, ResearchViewSnapshotId, ResearchViewTargetToken } from '../src/view-types.ts'
 
 const appearance = { theme: 'light', locale: 'en' } as const
-const selection: ResearchViewSelection = { planId: 1, versionPage: 0, runPages: {} }
+const selection: ResearchViewSelection = { planId: 1, runPages: {} }
 const node: ResearchPlanViewNode = { id: 'plan:1:1' as ResearchViewNodeId, kind: 'plan', planId: 1,
   revision: 1, title: 'Initial proposal', summary: 'Test evidence', path: 'plans/1.md', createdAt: '2026-09-01',
   column: 0, slot: 0, selected: true, sha256: 'abc' }
@@ -15,7 +15,7 @@ function snapshot(id = 's1', page: ResearchViewSelection = selection): ResearchV
     researchId: 'research' as ResearchId, goal: { goal: 'Measure results', description: 'Fixture', markdown: '', metrics: '', baseline: '' },
     state: { version: 1, revision: 1, at: '2026-09-01', sessionId: 'session', status: 'active', summary: 'Ready' },
     groups: [{ planId: 1, title: 'Initial proposal', latestRevision: 1, revisionCount: 1, runCount: 0, warningCount: 0 }],
-    selection: page, pages: { versionPages: 1, versionsPerPage: 3, runsPerVersionPage: 4, runCounts: { '1': 0 } },
+    selection: page, pages: { runsPerVersionPage: 4, runCounts: { '1': 0 } },
     nodes: [node], edges: [], outsideLinks: [], diagnostics: [] }
 }
 function artifact(revision: ResearchViewSnapshotId): ResearchViewRendered {
@@ -48,6 +48,20 @@ function bench(overrides: Partial<ResearchViewClientApi> = {}, watchRetryBaseMs?
 }
 
 describe('Research View read controller', () => {
+  it('ignores obsolete revision selection in requests and pending-query identity', async () => {
+    const b = bench()
+    const pending = Promise.withResolvers<ResearchViewRendered>()
+    b.api.renderView.mockReturnValueOnce(pending.promise)
+    const legacy = { ...selection, versionPage: 999 }
+    const first = b.controller.enter(legacy, appearance)
+    await vi.waitFor(() => expect(b.api.renderView).toHaveBeenCalledTimes(1))
+    const normalized = b.controller.load(selection, appearance)
+    expect(b.api.getView).toHaveBeenCalledTimes(1)
+    expect(b.api.getView.mock.calls[0]?.[0]).not.toHaveProperty('versionPage')
+    expect(b.api.renderView.mock.calls[0]?.[1].aborted).toBe(false)
+    pending.resolve(artifact('s1' as ResearchViewSnapshotId))
+    await Promise.all([first, normalized])
+  })
   it('fetches then renders once and reuses the identical snapshot render on refresh', async () => {
     const b = bench()
     const source = b.controller.source
@@ -82,8 +96,8 @@ describe('Research View read controller', () => {
     b.api.renderView.mockReturnValueOnce(rendering.promise)
     const old = b.controller.enter(selection, appearance)
     await vi.waitFor(() => expect(b.api.renderView).toHaveBeenCalledTimes(1))
-    b.api.getView.mockResolvedValue(snapshot('s2', { ...selection, versionPage: 1 }))
-    await b.controller.load({ ...selection, versionPage: 1 }, appearance)
+    b.api.getView.mockResolvedValue(snapshot('s2', { ...selection, runPages: { '1': 1 } }))
+    await b.controller.load({ ...selection, runPages: { '1': 1 } }, appearance)
     rendering.resolve(artifact('s1' as ResearchViewSnapshotId))
     await old
     expect(b.controller.source.getSnapshot().artifact?.revision).toBe('artifact-s2')
@@ -240,7 +254,7 @@ describe('Research View read controller', () => {
     await b.controller.enter(selection, appearance)
     await vi.waitFor(() => expect(seen).toContain('research-view/watch-ended'))
     // Non-forced loads and invalidations never open a second stream while a retry is pending.
-    await b.controller.load({ ...selection, versionPage: 1 }, appearance)
+    await b.controller.load({ ...selection, runPages: { '1': 1 } }, appearance)
     b.controller.invalidate()
     await vi.waitFor(() => expect(b.controller.source.getSnapshot().phase).toBe('ready'))
     // The backoff timer resubscribes on its own and clears the disconnect state.
@@ -252,7 +266,7 @@ describe('Research View read controller', () => {
     const pending = Promise.withResolvers<ResearchViewRendered>()
     const b = bench()
     b.api.renderView.mockReturnValueOnce(pending.promise)
-    const first = b.controller.enter({ planId: null, versionPage: 0, runPages: {} }, appearance)
+    const first = b.controller.enter({ planId: null, runPages: {} }, appearance)
     await vi.waitFor(() => expect(b.api.renderView).toHaveBeenCalledTimes(1))
     const normalized = b.controller.load(selection, appearance)
     expect(b.api.getView).toHaveBeenCalledTimes(1)
@@ -301,6 +315,17 @@ describe('Research View read controller', () => {
 })
 
 describe('Research View navigation store', () => {
+  it('drops obsolete revision paging from retained selections', () => {
+    const store = createResearchViewStore().create()
+    const legacy = { ...selection, versionPage: 999 }
+    store.actions.selectPage(legacy)
+    expect(store.store.getSnapshot().selection).toEqual(selection)
+    store.actions.selectPlan(2)
+    store.actions.selectPlan(1)
+    expect(store.store.getSnapshot().selection).toEqual(selection)
+    store.actions.accept('target' as ResearchViewTargetToken, legacy, [node.id])
+    expect(store.store.getSnapshot().selection).toEqual(selection)
+  })
   it('retains pages and cameras while data refreshes without selecting the newest node', () => {
     const store = createResearchViewStore().create()
     const token = 'target' as ResearchViewTargetToken
@@ -309,10 +334,10 @@ describe('Research View navigation store', () => {
     store.actions.setCamera('page', { scale: 2, x: 10, y: 20, mode: 'manual' })
     store.actions.accept(token, { ...selection }, [node.id, 'new-node' as ResearchViewNodeId])
     expect(store.store.getSnapshot().selectedNodeId).toBe(node.id)
-    store.actions.selectPage({ ...selection, versionPage: 1 })
+    store.actions.selectPage({ ...selection, runPages: { '1': 1 } })
     store.actions.selectPlan(2)
     store.actions.selectPlan(1)
-    expect(store.store.getSnapshot().selection.versionPage).toBe(1)
+    expect(store.store.getSnapshot().selection.runPages['1']).toBe(1)
     expect(store.store.getSnapshot().cameras.page?.scale).toBe(2)
     store.actions.accept('replacement' as ResearchViewTargetToken, selection, [node.id])
     expect(store.store.getSnapshot().cameras).toEqual({})

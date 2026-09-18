@@ -99,12 +99,29 @@ const uniquePaths = z.array(checkpointPath).max(2000).refine(paths => new Set(pa
 const oid = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u)
 const checkpointRef = z.string().regex(/^refs\/dsh\/research\/[0-9a-f-]+\/runs\/[0-9a-f-]+\/(?:input|output)$/u)
 
+const digestSchema = z.object({
+  path: checkpointPath,
+  sha256: z.string().regex(/^[0-9a-f]{64}$/u),
+  bytes: z.number().int().nonnegative().max(1024 * 1024 * 1024),
+}).strict()
+const scopedSnapshotSchema = z.object({
+  mode: z.literal('scoped'),
+  paths: z.array(checkpointPath).min(1).max(128).refine(paths => !paths.some((scope, index) => paths.some((other, j) => index !== j && (scope === other || scope.startsWith(other + '/')))), 'duplicate or overlapping scope paths'),
+  omitChanges: uniquePaths.optional(),
+  externalInputs: z.array(digestSchema).max(128).refine(items => new Set(items.map(item => item.path)).size === items.length, 'duplicate external inputs').optional(),
+}).strict()
+
 export const reproductionSchema = z.object({
   command: nonBlank,
   cwd: z.union([z.literal('.'), checkpointPath]),
   environment: jsonRecord,
   inputs: uniquePaths,
-}).strict()
+  snapshot: scopedSnapshotSchema.optional(),
+}).strict().superRefine((value, ctx) => {
+  for (const item of value.snapshot?.externalInputs ?? []) {
+    if (value.inputs.includes(item.path)) ctx.addIssue({ code: 'custom', message: 'external input cannot also be a captured explicit input' })
+  }
+})
 
 export const inputCheckpointSchema = z.object({
   backend: z.literal('git'),
@@ -116,7 +133,21 @@ export const inputCheckpointSchema = z.object({
   objectFormat: z.enum(['sha1', 'sha256']),
   files: uniquePaths,
   reproduction: reproductionSchema,
-}).strict()
+  snapshot: z.object({ mode: z.literal('scoped-overlay'), deleted: uniquePaths, omittedChanges: uniquePaths }).strict().optional(),
+}).strict().superRefine((value, ctx) => {
+  if ((value.snapshot !== undefined) !== (value.reproduction.snapshot !== undefined)) {
+    ctx.addIssue({ code: 'custom', message: 'scoped recipe and overlay marker must occur together' })
+  }
+  if (value.snapshot) {
+    if (value.snapshot.deleted.some(file => !value.files.includes(file))) ctx.addIssue({ code: 'custom', message: 'overlay deletion outside frozen files' })
+    if (value.snapshot.omittedChanges.some(file => value.files.includes(file))) ctx.addIssue({ code: 'custom', message: 'omitted change also captured' })
+    if (JSON.stringify([...value.snapshot.omittedChanges].sort()) !== JSON.stringify([...(value.reproduction.snapshot?.omitChanges ?? [])].sort())) ctx.addIssue({ code: 'custom', message: 'omitted changes were not explicitly acknowledged' })
+    const scopes = value.reproduction.snapshot?.paths ?? []
+    if (value.files.some(file => !value.reproduction.inputs.includes(file) && !scopes.some(scope => file === scope || file.startsWith(scope + '/')))) ctx.addIssue({ code: 'custom', message: 'captured file outside declared scope and explicit inputs' })
+    const external = new Set((value.reproduction.snapshot?.externalInputs ?? []).map(item => item.path))
+    if (value.files.some(file => external.has(file))) ctx.addIssue({ code: 'custom', message: 'external input also captured' })
+  }
+})
 
 export const outputCheckpointSchema = z.object({
   backend: z.literal('git'),
@@ -128,6 +159,7 @@ export const outputCheckpointSchema = z.object({
   outputTree: oid,
   objectFormat: z.enum(['sha1', 'sha256']),
   codeChanged: z.boolean(),
+  snapshot: z.object({ mode: z.literal('scoped-overlay'), baseHead: oid, deleted: uniquePaths }).strict().optional(),
   artifacts: z.array(z.object({
     path: checkpointPath,
     sha256: z.string().regex(/^[0-9a-f]{64}$/u),
@@ -146,7 +178,9 @@ export const researchRunDescriptionSchema: z.ZodType<ResearchRunDescription> = z
   z.object({ version: z.literal(1), ...descriptionFields }).strict(),
   z.object({ version: z.literal(2), ...descriptionFields, baseStateRevision: positiveRevision, checkpoint: inputCheckpointSchema }).strict(),
   z.object({ version: z.literal(3), ...descriptionFields, baseStateRevision: positiveRevision, checkpoint: inputCheckpointSchema, planRef: planVersionRefSchema }).strict(),
-])
+]).superRefine((value, ctx) => {
+  if (value.version === 2 && value.checkpoint.snapshot) ctx.addIssue({ code: 'custom', message: 'scoped checkpoints require plan-bound run v3' })
+})
 
 const resultFields = {
   type: z.literal('result'),
@@ -196,6 +230,7 @@ export const researchRunResultSchema: z.ZodType<ResearchRunResult> = z.discrimin
   z.object({ ...planResultFields, checkpoint: outputCheckpointSchema }).strict(),
 ]).superRefine((value, ctx) => {
   validateResultArtifacts(value, ctx)
+  if (value.version === 2 && value.checkpoint.snapshot) ctx.addIssue({ code: 'custom', message: 'scoped checkpoints require plan-bound run v3' })
   if (isCheckpointRunResult(value) && (new Set(value.artifacts).size !== value.artifacts.length
     || JSON.stringify(value.artifacts) !== JSON.stringify(value.checkpoint.artifacts.map(item => item.path)))) {
     ctx.addIssue({ code: 'custom', path: ['checkpoint', 'artifacts'], message: 'checkpoint digests must match the exact artifact list' })

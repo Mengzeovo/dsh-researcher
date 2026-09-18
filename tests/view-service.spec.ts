@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import type { ArchifyRenderResult } from 'dsh-archify-native/types'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { parseResearchId } from '../src/schema.ts'
-import { planNodeId } from '../src/view-projection.ts'
+import { planNodeId, runNodeId } from '../src/view-projection.ts'
 import type { ResearchViewChanged } from '../src/view-types.ts'
 import { deferred, domainError, ready, rendered, serviceFixture } from './view-service-helpers.ts'
 
@@ -36,6 +36,8 @@ describe('research view BFF unit providers', () => {
     const f = await serviceFixture()
     const snapshot = ready(await f.service.getView(request))
     expect(await f.service.getView({ ...request, ifNoneMatch: snapshot.snapshotId })).toEqual({ kind: 'unchanged', snapshotId: snapshot.snapshotId })
+    const obsolete = { ...request, versionPage: 999, ifNoneMatch: snapshot.snapshotId }
+    expect(await f.service.getView(obsolete)).toEqual({ kind: 'unchanged', snapshotId: snapshot.snapshotId })
     f.observations.set('other/session', { cwd: f.root, researchId: f.target.id })
     const node = { sessionId: 'other/session', snapshotId: snapshot.snapshotId, nodeId: snapshot.nodes[0]!.id }
     expect((await f.service.getViewNode(node)).kind).toBe('plan')
@@ -51,10 +53,13 @@ describe('research view BFF unit providers', () => {
   })
 
   it('rejects off-page nodes and changed authority before detail or rendering', async () => {
-    const f = await serviceFixture({ versionsPerPage: 1 })
+    const f = await serviceFixture({ runsPerVersionPage: 1 })
     await f.addVersion(1, 1)
-    const snapshot = ready(await f.service.getView({ ...request, versionPage: 0 }))
-    await expect(f.service.getViewNode({ ...request, snapshotId: snapshot.snapshotId, nodeId: planNodeId(1, 2) })).rejects.toMatchObject(domainError('RESEARCH_NOT_FOUND'))
+    await f.addRun()
+    const hidden = await f.addRun()
+    const snapshot = ready(await f.service.getView({ ...request, runPages: { 1: 0 } }))
+    expect((await f.service.getViewNode({ ...request, snapshotId: snapshot.snapshotId, nodeId: planNodeId(1, 2) })).kind).toBe('plan')
+    await expect(f.service.getViewNode({ ...request, snapshotId: snapshot.snapshotId, nodeId: runNodeId(hidden.runId) })).rejects.toMatchObject(domainError('RESEARCH_NOT_FOUND'))
     await f.addVersion(1, 2)
     await expect(f.service.getViewNode({ ...request, snapshotId: snapshot.snapshotId, nodeId: snapshot.nodes[0]!.id })).rejects.toMatchObject(domainError('RESEARCH_VIEW_STALE'))
     await expect(f.service.renderView({ ...request, snapshotId: snapshot.snapshotId, ...theme })).rejects.toMatchObject(domainError('RESEARCH_VIEW_STALE'))
@@ -148,10 +153,12 @@ describe('research view BFF unit providers', () => {
   })
 
   it('aborts native work on changed target, page eviction, caller abort and service disposal', async () => {
-    const f = await serviceFixture({ cacheEntries: 1, versionsPerPage: 1 })
+    const f = await serviceFixture({ cacheEntries: 1, runsPerVersionPage: 1 })
     await f.addVersion(1, 1)
+    await f.addRun()
+    await f.addRun()
     for (const action of ['change', 'evict', 'caller', 'dispose'] as const) {
-      const page = ready(await f.service.getView({ ...request, versionPage: 0 }))
+      const page = ready(await f.service.getView({ ...request, runPages: { 1: 0 } }))
       const started = deferred<AbortSignal>(); const caller = new AbortController()
       f.renderWorkflow.mockImplementationOnce(async (_input, signal) => {
         if (signal === undefined) throw new Error('renderer requires operation signal')
@@ -162,7 +169,7 @@ describe('research view BFF unit providers', () => {
       const rejection = expect(operation).rejects.toBeDefined()
       const signal = await started.promise
       if (action === 'change') f.context.emit('researcher/changed', { workspaceRoot: f.root, researchId: f.target.id })
-      else if (action === 'evict') await f.service.getView({ ...request, versionPage: 1 })
+      else if (action === 'evict') await f.service.getView({ ...request, runPages: { 1: 1 } })
       else if (action === 'caller') caller.abort()
       else await f.fiber.dispose()
       await rejection

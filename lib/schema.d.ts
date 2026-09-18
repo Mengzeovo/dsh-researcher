@@ -48,6 +48,16 @@ export declare const reproductionSchema: z.ZodObject<{
     cwd: z.ZodUnion<readonly [z.ZodLiteral<".">, z.ZodString]>;
     environment: z.ZodRecord<z.ZodString, z.ZodJSONSchema>;
     inputs: z.ZodArray<z.ZodString>;
+    snapshot: z.ZodOptional<z.ZodObject<{
+        mode: z.ZodLiteral<"scoped">;
+        paths: z.ZodArray<z.ZodString>;
+        omitChanges: z.ZodOptional<z.ZodArray<z.ZodString>>;
+        externalInputs: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            path: z.ZodString;
+            sha256: z.ZodString;
+            bytes: z.ZodNumber;
+        }, z.core.$strict>>>;
+    }, z.core.$strict>>;
 }, z.core.$strict>;
 export declare const inputCheckpointSchema: z.ZodObject<{
     backend: z.ZodLiteral<"git">;
@@ -66,7 +76,22 @@ export declare const inputCheckpointSchema: z.ZodObject<{
         cwd: z.ZodUnion<readonly [z.ZodLiteral<".">, z.ZodString]>;
         environment: z.ZodRecord<z.ZodString, z.ZodJSONSchema>;
         inputs: z.ZodArray<z.ZodString>;
+        snapshot: z.ZodOptional<z.ZodObject<{
+            mode: z.ZodLiteral<"scoped">;
+            paths: z.ZodArray<z.ZodString>;
+            omitChanges: z.ZodOptional<z.ZodArray<z.ZodString>>;
+            externalInputs: z.ZodOptional<z.ZodArray<z.ZodObject<{
+                path: z.ZodString;
+                sha256: z.ZodString;
+                bytes: z.ZodNumber;
+            }, z.core.$strict>>>;
+        }, z.core.$strict>>;
     }, z.core.$strict>;
+    snapshot: z.ZodOptional<z.ZodObject<{
+        mode: z.ZodLiteral<"scoped-overlay">;
+        deleted: z.ZodArray<z.ZodString>;
+        omittedChanges: z.ZodArray<z.ZodString>;
+    }, z.core.$strict>>;
 }, z.core.$strict>;
 export declare const outputCheckpointSchema: z.ZodObject<{
     backend: z.ZodLiteral<"git">;
@@ -81,6 +106,11 @@ export declare const outputCheckpointSchema: z.ZodObject<{
         sha1: "sha1";
     }>;
     codeChanged: z.ZodBoolean;
+    snapshot: z.ZodOptional<z.ZodObject<{
+        mode: z.ZodLiteral<"scoped-overlay">;
+        baseHead: z.ZodString;
+        deleted: z.ZodArray<z.ZodString>;
+    }, z.core.$strict>>;
     artifacts: z.ZodArray<z.ZodObject<{
         path: z.ZodString;
         sha256: z.ZodString;

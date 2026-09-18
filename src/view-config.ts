@@ -5,7 +5,6 @@ import type { ResearchViewConfig } from './view-types.ts'
 export const researchViewConfigSchema: z.ZodType<ResearchViewConfig> = z.object({
   enabled: z.boolean().default(false),
   presetIds: z.array(z.string().min(1)).min(1).default(['research']),
-  versionsPerPage: z.number().int().min(1).max(3).default(3),
   runsPerVersionPage: z.number().int().min(1).max(4).default(4),
   maxRecords: z.number().int().positive().default(6000),
   maxDataBytes: z.number().int().positive().default(32 * 1024 * 1024),

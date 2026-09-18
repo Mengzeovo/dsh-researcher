@@ -22,6 +22,48 @@ function text(description: unknown, result?: unknown) {
 }
 
 describe('checkpoint record validation', () => {
+  it('validates explicit scope, digests and acknowledgements without defaulting old recipes', () => {
+    const { description } = fixture()
+    const base = description.checkpoint.reproduction
+    const snapshot = { mode: 'scoped', paths: ['src'], externalInputs: [{ path: 'data.bin', bytes: 3, sha256: 'a'.repeat(64) }] }
+    expect(reproductionSchema.parse(base)).toEqual(base)
+    expect(reproductionSchema.parse({ ...base, snapshot })).toEqual({ ...base, snapshot })
+    for (const paths of [[], ['src', 'src'], ['src', 'src/a.ts'], ['.'], ['src/'], ['../src'], ['.git'], ['.research']]) {
+      expect(reproductionSchema.safeParse({ ...base, snapshot: { ...snapshot, paths } }).success).toBe(false)
+    }
+    expect(reproductionSchema.safeParse({ ...base, inputs: ['data.bin'], snapshot }).success).toBe(false)
+    for (const bytes of [-1, 1.5, 1024 * 1024 * 1024 + 1]) {
+      expect(reproductionSchema.safeParse({ ...base, snapshot: { ...snapshot, externalInputs: [{ ...snapshot.externalInputs[0], bytes }] } }).success).toBe(false)
+    }
+  })
+
+  it('binds scoped markers, deletion population, base identity and explicit omitted changes in v3 records', () => {
+    const old = fixture()
+    const planRef = { planId: 3, revision: 5, sha256: 'a'.repeat(64) }
+    const description = { ...old.description, version: 3, planRef, checkpoint: { ...old.description.checkpoint,
+      reproduction: { ...old.description.checkpoint.reproduction, snapshot: { mode: 'scoped', paths: ['main.py'] } },
+      snapshot: { mode: 'scoped-overlay', deleted: [], omittedChanges: [] },
+    } }
+    const result = { ...old.result, version: 3, planRef, transition: { ...old.result.transition, version: 2, selectedPlanRef: planRef },
+      checkpoint: { ...old.result.checkpoint, snapshot: { mode: 'scoped-overlay', baseHead: description.checkpoint.baseHead, deleted: [] } },
+    }
+    expect(parseRunLog(id, text(description, result)).result).toEqual(result)
+    const { snapshot: _marker, ...unmarked } = description.checkpoint
+    expect(researchRunDescriptionSchema.safeParse({ ...description, checkpoint: unmarked }).success).toBe(false)
+    const { snapshot: _recipe, ...unscoped } = description.checkpoint.reproduction
+    expect(researchRunDescriptionSchema.safeParse({ ...description, checkpoint: { ...description.checkpoint, reproduction: unscoped } }).success).toBe(false)
+    for (const snapshot of [
+      { ...description.checkpoint.snapshot, deleted: ['unfrozen.py'] },
+      { ...description.checkpoint.snapshot, omittedChanges: ['unreviewed.py'] },
+    ]) expect(researchRunDescriptionSchema.safeParse({ ...description, checkpoint: { ...description.checkpoint, snapshot } }).success).toBe(false)
+    for (const snapshot of [
+      undefined,
+      { ...result.checkpoint.snapshot, baseHead: '9'.repeat(40) },
+      { ...result.checkpoint.snapshot, deleted: ['unfrozen.py'] },
+    ]) expect(() => parseRunLog(id, text(description, { ...result, checkpoint: { ...result.checkpoint, snapshot } }))).toThrow()
+    expect(researchRunDescriptionSchema.safeParse({ ...old.description, checkpoint: description.checkpoint }).success).toBe(false)
+  })
+
   it('accepts complete v2 pairs and rejects fabricated version mixing', () => {
     const { description, result } = fixture()
     expect(parseRunLog(id, text(description, result)).description.version).toBe(2)

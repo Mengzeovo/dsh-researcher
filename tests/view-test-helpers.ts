@@ -12,7 +12,7 @@ import { mockCheckpoints, testContext, testReproduction, testSession } from './h
 
 export const viewConfig = researchViewConfigSchema.parse({ enabled: true })
 export const viewToken = 'view_test_target' as ResearchViewTargetToken
-export const viewRequest = (patch: Partial<ResearchViewRequest> = {}): ResearchViewRequest => ({ sessionId: 'view/test', planId: 1, versionPage: 0, ...patch })
+export const viewRequest = (patch: Partial<ResearchViewRequest> = {}): ResearchViewRequest => ({ sessionId: 'view/test', planId: 1, ...patch })
 export const planContent = { title: '估计器方案', body: 'Measure estimator error against the recorded baseline.', delta: ['初始方案'] }
 export async function viewFixture() {
   const root = await mkdtemp(path.join(tmpdir(), 'researcher-view-'))

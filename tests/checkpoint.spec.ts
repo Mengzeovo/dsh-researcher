@@ -83,6 +83,105 @@ describe('immutable raw Git checkpoints', () => {
     expect((await readdir(path.join(root, '.git'))).filter(name => name.startsWith('dsh-index-'))).toEqual([])
   })
 
+  it('captures tracked relative directory links as mode 120000 text without reading target files', async () => {
+    await put('doc/figures/oversized.bin', Buffer.alloc(CHECKPOINT_MAX_FILE_BYTES + 1))
+    await mkdir(path.join(root, 'doc/manual'), { recursive: true })
+    await symlink('../figures', path.join(root, 'doc/manual/figures'))
+    await git('add', 'doc/manual/figures')
+    const index = await readFile(path.join(root, '.git/index'))
+    const input = await start()
+    expect(await git('show', input.inputCommit + ':doc/manual/figures')).toEqual(Buffer.from('../figures'))
+    expect((await git('ls-tree', '-r', input.inputCommit)).toString()).toContain('120000 blob')
+    expect(input.files).toEqual(['code.txt', 'doc/manual/figures'])
+    const output = await provider.finish(testSession(root), input, 'key', prepared())
+    expect(output.checkpoint.codeChanged).toBe(false)
+    expect(await readFile(path.join(root, '.git/index'))).toEqual(index)
+  })
+
+  it('captures dangling in-workspace links and changes to their raw targets', async () => {
+    await symlink('missing-a', path.join(root, 'link'))
+    await git('add', 'link')
+    const input = await start()
+    await rm(path.join(root, 'link'))
+    await symlink('missing-b', path.join(root, 'link'))
+    const output = await provider.finish(testSession(root), input, 'key', prepared())
+    expect(output.checkpoint.codeChanged).toBe(true)
+    expect(await git('show', output.checkpoint.outputCommit + ':link')).toEqual(Buffer.from('missing-b'))
+    expect((await git('ls-tree', output.checkpoint.outputCommit, 'link')).toString()).toContain('120000')
+  })
+
+  it.each(['delete', 'regular'] as const)('captures tracked link becoming %s without touching its target', async operation => {
+    await symlink('code.txt', path.join(root, 'link'))
+    await git('add', 'link')
+    const input = await start()
+    await rm(path.join(root, 'link'))
+    if (operation === 'regular') await put('link', 'now regular')
+    const output = await provider.finish(testSession(root), input, 'key', prepared())
+    expect(output.checkpoint.codeChanged).toBe(true)
+    const entry = (await git('ls-tree', output.checkpoint.outputCommit, 'link')).toString()
+    expect(operation === 'delete' ? entry === '' : entry.includes('100644')).toBe(true)
+    expect(await readFile(path.join(root, 'code.txt'), 'utf8')).toBe('original\n')
+  })
+
+  it('captures a tracked regular file changed to a link unless it was an explicit input', async () => {
+    const input = await start()
+    await rm(path.join(root, 'code.txt'))
+    await symlink('missing', path.join(root, 'code.txt'))
+    const output = await provider.finish(testSession(root), input, 'key', prepared())
+    expect((await git('ls-tree', output.checkpoint.outputCommit, 'code.txt')).toString()).toContain('120000')
+  })
+
+  it('rejects a tracked link explicitly declared as an input', async () => {
+    await symlink('code.txt', path.join(root, 'link'))
+    await git('add', 'link')
+    await expect(start(['link'])).rejects.toThrow(/symlink/u)
+    expect(await pinned()).toBe('')
+  })
+
+  it.each([false, true])('keeps explicit inputs regular at finish, tracked=%s', async tracked => {
+    await put('extra.txt', 'explicit bytes')
+    if (tracked) await git('add', 'extra.txt')
+    const input = await start(['extra.txt'])
+    await rm(path.join(root, 'extra.txt'))
+    await symlink('code.txt', path.join(root, 'extra.txt'))
+    await expect(provider.finish(testSession(root), input, 'key', prepared())).rejects.toThrow(/symlink/u)
+    expect(await pinned()).not.toContain('/output')
+  })
+
+  it.each(['/etc/passwd', '../outside', '.git/config', '.research/state.jsonl', '.env'])('rejects unsafe tracked link target %s without publishing', async target => {
+    await symlink(target, path.join(root, 'link'))
+    await git('add', 'link')
+    await expect(start()).rejects.toThrow(/symlink|metadata|secret/u)
+    expect(await pinned()).toBe('')
+  })
+
+  it('rejects a tracked directory link as reproduction cwd or artifact', async () => {
+    await mkdir(path.join(root, 'directory'))
+    await symlink('directory', path.join(root, 'link'))
+    await git('add', 'link')
+    await expect(provider.start(testSession(root), 'research-1', 'run-cwd', at, { ...reproduction(), cwd: 'link' })).rejects.toThrow(/symlink/u)
+    const input = await start()
+    await expect(provider.finish(testSession(root), input, 'key', prepared(['link']))).rejects.toThrow(/symlink/u)
+  })
+
+  it.each(['hash-object', 'commit-tree'] as const)('detects tracked link replacement during %s before ref publication', async point => {
+    await symlink('missing-a', path.join(root, 'link'))
+    await git('add', 'link')
+    let mutated = false
+    provider = new GitCheckpointProvider(ctx, async command => {
+      const result = await runner(command)
+      if (!mutated && command.argv.includes(point)) {
+        mutated = true
+        await rm(path.join(root, 'link'))
+        await symlink('missing-b', path.join(root, 'link'))
+      }
+      return result
+    })
+    await expect(start()).rejects.toThrow(/file changed before checkpoint publication: link/u)
+    expect(mutated).toBe(true)
+    expect(await pinned()).toBe('')
+  })
+
   it('includes only explicit untracked inputs, excludes research metadata, captures raw binary without filters', async () => {
     const bytes = Buffer.from([0, 255, 254, 13, 10, 128, 0])
     await put('binary.bin', bytes)
